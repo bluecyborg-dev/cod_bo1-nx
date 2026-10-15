@@ -7,9 +7,11 @@
 // layout has no cost.
 
 #include "native_textures.h"
+#include "texture_pool.h"
 #include "native_hash.h"
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -43,6 +45,15 @@ namespace bo1::native {
 
 namespace xenos = rex::graphics::xenos;
 namespace texture_util = rex::graphics::texture_util;
+
+namespace {
+// bo1-nx: for the texture lookup breakdown (hashing, image creation).
+uint64_t NowNsTextures() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+}  // namespace
 namespace texture_conversion = rex::graphics::texture_conversion;
 using rex::graphics::FormatInfo;
 using rex::ui::vulkan::VulkanDevice;
@@ -500,6 +511,8 @@ constexpr uint32_t kSyncCreatesPerFrame = 2;
 constexpr VkDeviceSize kSyncCreateMaxBytes = 32 * 1024;
 constexpr VkDeviceSize kSyncCreateLargeBytes = 256 * 1024;   // bo1-nx
 constexpr VkDeviceSize kSyncCreateBudgetBytes = 1536 * 1024;  // bo1-nx, per frame
+constexpr VkDeviceSize kSyncCreateBurstBytes = 6 * 1024 * 1024;  // bo1-nx, per frame with a backlog
+constexpr size_t kSyncBacklogJobs = 24;                         // bo1-nx
 
 // New textures with at least this much host data stream in asynchronously.
 // Nearly all of them: the cost that hitched was not the data but creating the
@@ -529,6 +542,9 @@ struct TextureCache::Texture {
   uint32_t level_count = 0;
   uint32_t layers = 0;
   VkDeviceSize memory_size = 0;  // bo1-nx: 0 when not known (not counted in the budget)
+  // bo1-nx: its guest memory was written by a copy the renderer knows about (InvalidateRange): memoized lookups of
+  // it go through the full path once, which checks the data and clears this.
+  bool invalidated = false;
 };
 
 struct TextureCache::Impl {
@@ -554,6 +570,30 @@ struct TextureCache::Impl {
     uint32_t base = 0, base_bytes = 0, mips = 0, mip_bytes = 0;
   };
   std::unordered_map<uint64_t, GuestRanges> guest_ranges;
+  // The same, indexed by 64 KB page: an invalidation looks only at the textures on its pages. Scanning every layout
+  // ever seen (tens of thousands) for each of the streamer's ~40 copies a frame was millions of comparisons a frame,
+  // the bulk of the ring thread on the console.
+  std::unordered_map<uint32_t, std::vector<uint64_t>> guest_pages;
+  void AddGuestRanges(uint64_t key, const GuestRanges& r) {
+    auto [it, inserted] = guest_ranges.try_emplace(key, r);
+    if (!inserted) {
+      if (it->second.base == r.base && it->second.base_bytes == r.base_bytes && it->second.mips == r.mips &&
+          it->second.mip_bytes == r.mip_bytes) {
+        return;
+      }
+      it->second = r;
+    }
+    auto add = [&](uint32_t start, uint32_t bytes) {
+      if (!bytes) return;
+      for (uint32_t page = start >> 16; page <= (start + bytes - 1) >> 16; ++page) guest_pages[page].push_back(key);
+    };
+    add(r.base, r.base_bytes);
+    add(r.mips, r.mip_bytes);
+    if (guest_ranges.size() > 65536) {
+      guest_ranges.clear();
+      guest_pages.clear();
+    }
+  }
   // bo1-nx: uncompressed 3D textures from guest memory (project8-sw's cache never needed them; BO1 samples a
   // 512x256x4 k_8_8_8_8 volume that read as zero, apparently its ambient lighting, so shadowed areas came out black).
   struct Volume3D {
@@ -565,6 +605,10 @@ struct TextureCache::Impl {
     uint64_t last_used_frame = 0;
   };
   std::unordered_map<uint64_t, Volume3D> volumes3d;
+  // bo1-nx: the last ready texture for each (mips address, format, size, dimension). BO1's streamer gives a texture a
+  // new top level at a new address and keeps its mips: the renderer sees a new texture, which was drawn black for the
+  // frame or two it took to build (a flicker at 10 FPS). Meanwhile its predecessor stands in.
+  std::unordered_map<uint64_t, uint64_t> placeholders;
   struct UploadStat {
     uint32_t address = 0, format = 0, width = 0, height = 0, count = 0;
     uint64_t bytes = 0, last_hash = 0;
@@ -617,6 +661,7 @@ struct TextureCache::Impl {
   uint64_t out_valid_until = 0;
   uint32_t sync_creates_left = 0;
   VkDeviceSize sync_create_bytes_left = 0;
+  VkDeviceSize sync_create_large_limit = 0;
   FlatMap64<Memo> memo;
   uint64_t memo_frame = UINT64_MAX;
   // The texture GetViewUncached returned a view of (null for resolve
@@ -708,9 +753,7 @@ struct TextureCache::Impl {
         job = stream_jobs.front();
         stream_jobs.pop_front();
       }
-      job->ok = rex::ui::vulkan::util::CreateDedicatedAllocationImage(
-          device, job->info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal, job->image,
-          job->memory, nullptr, &job->memory_size);
+      job->ok = CreateTextureImage(job->info, job->image, job->memory, &job->memory_size);
       if (job->ok) {
         job->ok = rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
             device, job->staging_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -821,6 +864,50 @@ struct TextureCache::Impl {
     }
   }
 
+  // bo1-nx: textures sub-allocated from large blocks (texture_pool.h): a dedicated allocation per texture cost
+  // ~8 ms of the ring thread each on the console (BO1 made ~3 a frame in play: 20-30 ms per frame). The streaming
+  // worker creates images too, hence the lock. A pooled image has no VkDeviceMemory of its own; its block goes back
+  // to the pool when the image is destroyed, which happens only after the GPU finished the frames that used it.
+  TexturePool pool;
+  std::mutex pool_mutex;
+  std::unordered_map<VkImage, uint32_t> pooled_images;
+  bool CreateTextureImage(const VkImageCreateInfo& info, VkImage& image, VkDeviceMemory& memory,
+                          VkDeviceSize* size_out) {
+    image = VK_NULL_HANDLE;
+    memory = VK_NULL_HANDLE;
+    const auto& dfn = device->functions();
+    VkDevice d = device->device();
+    if (pool.Active() && dfn.vkCreateImage(d, &info, nullptr, &image) == VK_SUCCESS) {
+      VkMemoryRequirements requirements = {};
+      dfn.vkGetImageMemoryRequirements(d, image, &requirements);
+      VkDeviceMemory block_memory = VK_NULL_HANDLE;
+      VkDeviceSize offset = 0;
+      uint32_t block = kInvalidPoolBlock;
+      std::lock_guard<std::mutex> lock(pool_mutex);
+      if (pool.Reserve(requirements, block_memory, offset, block)) {
+        if (dfn.vkBindImageMemory(d, image, block_memory, offset) == VK_SUCCESS) {
+          pooled_images[image] = block;
+          if (size_out) *size_out = requirements.size;
+          return true;
+        }
+        pool.Release(block);
+      }
+      pool.NoteDedicated();
+      dfn.vkDestroyImage(d, image, nullptr);
+      image = VK_NULL_HANDLE;
+    }
+    return rex::ui::vulkan::util::CreateDedicatedAllocationImage(
+        device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal, image, memory, nullptr, size_out);
+  }
+  void ReleasePooled(VkImage image) {
+    if (!image) return;
+    std::lock_guard<std::mutex> lock(pool_mutex);
+    auto it = pooled_images.find(image);
+    if (it == pooled_images.end()) return;
+    pool.Release(it->second);
+    pooled_images.erase(it);
+  }
+
   void DestroyLater(VkImage image, VkDeviceMemory memory, std::vector<VkImageView> views) {
     if (!views.empty()) {
       // Now, not when the reaper gets to it: before a handle can be reused.
@@ -832,7 +919,11 @@ struct TextureCache::Impl {
       VkDevice d = device->device();
       for (VkImageView v : views) dfn.vkDestroyImageView(d, v, nullptr);
       if (image) dfn.vkDestroyImage(d, image, nullptr);
-      if (memory) dfn.vkFreeMemory(d, memory, nullptr);
+      if (memory) {
+        dfn.vkFreeMemory(d, memory, nullptr);
+      } else {
+        ReleasePooled(image);
+      }
     });
   }
 
@@ -847,7 +938,11 @@ struct TextureCache::Impl {
       dfn.vkDestroyImageView(d, v, nullptr);
     }
     if (image) dfn.vkDestroyImage(d, image, nullptr);
-    if (memory) dfn.vkFreeMemory(d, memory, nullptr);
+    if (memory) {
+      dfn.vkFreeMemory(d, memory, nullptr);
+    } else {
+      ReleasePooled(image);
+    }
   }
 };
 
@@ -865,6 +960,7 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
   im.reap_thread = std::thread([&im]() { im.ReapThread(); });
   im.device = device;
   im.memory = memory;
+  im.pool.Init(device, int32_t(REXCVAR_GET(bo1_native_texture_budget_mb)));
   im.max_anisotropy =
       device->properties().samplerAnisotropy
           ? std::min({16.0f, device->properties().maxSamplerAnisotropy,
@@ -1015,6 +1111,12 @@ void TextureCache::Shutdown() {
     im.DestroyNow(volume.image, volume.memory, views);
   }
   im.volumes3d.clear();
+  // Every pooled image is destroyed by now (textures, at shutdown, are destroyed right away).
+  {
+    std::lock_guard<std::mutex> lock(im.pool_mutex);
+    im.pooled_images.clear();
+    im.pool.Shutdown();
+  }
   for (auto& [k, s] : im.samplers) {
     dfn.vkDestroySampler(d, s, nullptr);
   }
@@ -1035,7 +1137,20 @@ void TextureCache::BeginFrame(uint64_t frame, uint64_t completed_frame) {
   im.frame = frame;
   im.completed_frame = completed_frame;
   im.sync_creates_left = kSyncCreatesPerFrame;
-  im.sync_create_bytes_left = kSyncCreateBudgetBytes;
+  {
+    std::lock_guard<std::mutex> lock(im.pool_mutex);
+    im.pool.PerFrame(frame);
+    if (frame % 600 == 0 && im.pool.Active()) REXLOG_INFO("[native] {}", im.pool.Summary());
+  }
+  // bo1-nx: with a backlog (a map just started: hundreds of new textures, drawn black until they arrive), a larger
+  // budget: a few slower frames, but the textures appear in about a second instead of several at 10 FPS.
+  size_t backlog = 0;
+  {
+    std::lock_guard<std::mutex> lock(im.stream_mutex);
+    backlog = im.stream_jobs.size();
+  }
+  im.sync_create_bytes_left = backlog >= kSyncBacklogJobs ? kSyncCreateBurstBytes : kSyncCreateBudgetBytes;
+  im.sync_create_large_limit = backlog >= kSyncBacklogJobs ? (2u << 20) : kSyncCreateLargeBytes;
   // Destroy what the GPU no longer uses.
   auto it = std::remove_if(im.retired.begin(), im.retired.end(), [&](Impl::Retired& r) {
     if (r.frame > completed_frame) {
@@ -1293,7 +1408,8 @@ std::vector<VkImageCopy> TextureCache::VolumeRegions(const ResolveDestination& d
 
 VkImageView TextureCache::GetVolumeView(const xenos::xe_gpu_texture_fetch_t& fetch, VkFormat host_format,
                                         uint32_t host_format_swizzle, uint32_t width, uint32_t height,
-                                        uint32_t depth, uint32_t base_page, UploadTarget& upload) {
+                                        uint32_t depth, uint32_t base_page, UploadTarget& upload,
+                                        bool as_2d_array) {
   Impl& im = *impl_;
   const auto& dfn = im.device->functions();
   VkDevice d = im.device->device();
@@ -1329,6 +1445,8 @@ VkImageView TextureCache::GetVolumeView(const xenos::xe_gpu_texture_fetch_t& fet
     VkImageCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     info.imageType = VK_IMAGE_TYPE_3D;
+    // A 2D fetch of it (BO1 has one) samples its slices as the layers of a 2D array view.
+    info.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     info.format = host_format;
     info.extent = {width, height, depth};
     info.mipLevels = 1;
@@ -1408,19 +1526,21 @@ VkImageView TextureCache::GetVolumeView(const xenos::xe_gpu_texture_fetch_t& fet
                              0, nullptr, 1, &barrier);
   }
   const uint32_t swizzle = GuestToHostSwizzle(fetch.swizzle, host_format_swizzle);
-  auto it = v.views.find(swizzle);
+  const uint32_t view_key = swizzle | (as_2d_array ? (1u << 31) : 0);
+  auto it = v.views.find(view_key);
   if (it != v.views.end()) return it->second;
   VkImageViewCreateInfo view = {};
   view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
   view.image = v.image;
-  view.viewType = VK_IMAGE_VIEW_TYPE_3D;
+  view.viewType = as_2d_array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_3D;
   view.format = host_format;
   view.components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1), ComponentSwizzle(swizzle, 2),
                      ComponentSwizzle(swizzle, 3)};
   view.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
+  if (as_2d_array) view.subresourceRange.layerCount = depth;
   VkImageView result = VK_NULL_HANDLE;
   if (dfn.vkCreateImageView(d, &view, nullptr, &result) != VK_SUCCESS) return VK_NULL_HANDLE;
-  v.views.emplace(swizzle, result);
+  v.views.emplace(view_key, result);
   return result;
 }
 
@@ -1428,19 +1548,26 @@ void TextureCache::InvalidateRange(uint32_t start, uint32_t bytes) {
   Impl& im = *impl_;
   const uint64_t end = uint64_t(start) + bytes;
   bool any = false;
-  for (const auto& [key, ranges] : im.guest_ranges) {
-    const bool base_hit = ranges.base_bytes && ranges.base < end && start < uint64_t(ranges.base) + ranges.base_bytes;
-    const bool mip_hit = ranges.mip_bytes && ranges.mips < end && start < uint64_t(ranges.mips) + ranges.mip_bytes;
-    if (base_hit || mip_hit) {
-      if (Impl::Checked* c = im.checked.find(key)) *c = Impl::Checked{};
-      any = true;
+  if (!bytes) return;
+  for (uint32_t page = start >> 16; page <= uint32_t((end - 1) >> 16); ++page) {
+    auto list = im.guest_pages.find(page);
+    if (list == im.guest_pages.end()) continue;
+    for (uint64_t key : list->second) {
+      auto r = im.guest_ranges.find(key);
+      if (r == im.guest_ranges.end()) continue;
+      const auto& ranges = r->second;
+      const bool base_hit =
+          ranges.base_bytes && ranges.base < end && start < uint64_t(ranges.base) + ranges.base_bytes;
+      const bool mip_hit = ranges.mip_bytes && ranges.mips < end && start < uint64_t(ranges.mips) + ranges.mip_bytes;
+      if (base_hit || mip_hit) {
+        if (Impl::Checked* c = im.checked.find(key)) *c = Impl::Checked{};
+        auto t = im.textures.find(key);
+        if (t != im.textures.end()) t->second->invalidated = true;
+        any = true;
+      }
     }
   }
-  if (any) {
-    im.memo.clear();
-    ++im.answers_epoch;
-  }
-  if (im.guest_ranges.size() > 65536) im.guest_ranges.clear();
+  (void)any;
 }
 
 void TextureCache::CopyToSized(ResolveDestination& dest, VkCommandBuffer commands) {
@@ -1632,7 +1759,8 @@ VkImageView TextureCache::GetView(const xenos::xe_gpu_texture_fetch_t& fetch,
   uint64_t memo_key = XXH3_64bits_withSeed(&fetch, sizeof(fetch),
                                            uint64_t(dimension) | (uint64_t(is_signed) << 2));
   Impl::Memo& memo = im.memo[memo_key];
-  if (memo.view && (memo.frame == im.frame || memo.valid_until >= im.frame)) {
+  if (memo.view && (memo.frame == im.frame || memo.valid_until >= im.frame) &&
+      !(memo.texture && memo.texture->invalidated)) {
     if (memo.texture) {
       memo.texture->last_used_submission = upload.submission;
       // What frees the texture once the GPU is done with it goes by this.
@@ -1888,10 +2016,12 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
   // 1D and 3D textures are not handled. 1D ones were tried as 2D textures a
   // texel tall; the first run with them had Free Skate's world geometry
   // stretched and untextured, which it never was with them drawn empty.
-  if (fetch.dimension == xenos::DataDimension::k3D && dimension == xenos::FetchOpDimension::k3DOrStacked &&
+  if (fetch.dimension == xenos::DataDimension::k3D &&
+      (dimension == xenos::FetchOpDimension::k3DOrStacked || dimension == xenos::FetchOpDimension::k2D) &&
       host_format.conversion == Conversion::kCopy && !host_format.compressed && base_page) {
     VkImageView volume = GetVolumeView(fetch, host_format.unorm, host_format.swizzle, width_minus_1 + 1,
-                                       height_minus_1 + 1, depth_minus_1 + 1, base_page, upload);
+                                       height_minus_1 + 1, depth_minus_1 + 1, base_page, upload,
+                                       dimension == xenos::FetchOpDimension::k2D);
     if (volume) return volume;
   }
   if (host_format.conversion == Conversion::kUnsupported ||
@@ -1905,6 +2035,13 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
       REXLOG_WARN("[native] Texture not handled: format {}, dimension {}, {}x{}x{}",
                   uint32_t(format), uint32_t(fetch.dimension), width_minus_1 + 1,
                   height_minus_1 + 1, depth_minus_1 + 1);
+    }
+    static uint32_t detail_logged = 0;
+    if (detail_logged < 6) {
+      ++detail_logged;
+      REXLOG_WARN("[native]   (lookup as fetch dimension {}, conversion {}, compressed {}, base page {:05X}, pitch {})",
+                  uint32_t(dimension), uint32_t(host_format.conversion), host_format.compressed, base_page,
+                  uint32_t(fetch.pitch));
     }
     return null_view;
   }
@@ -1927,6 +2064,10 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
   key.tiled = fetch.tiled;
   key.packed_mips = fetch.packed_mips;
   uint64_t key_hash = XXH3_64bits(&key, sizeof(key));
+  struct PlaceholderSignature {
+    uint32_t mip_page, format, width, height, dimension;
+  } placeholder_key = {mip_page, uint32_t(fetch.format), width_minus_1, height_minus_1, uint32_t(fetch.dimension)};
+  const uint64_t placeholder_signature = XXH3_64bits(&placeholder_key, sizeof(placeholder_key));
 
   uint32_t width = width_minus_1 + 1;
   uint32_t height = height_minus_1 + 1;
@@ -1947,12 +2088,13 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
   }
 
   // The content, hashed at most once per frame for each layout.
-  im.guest_ranges[key_hash] = {base_page << 12, base_size, mip_page << 12, mip_size};
+  im.AddGuestRanges(key_hash, {base_page << 12, base_size, mip_page << 12, mip_size});
   Impl::Checked& checked = im.checked[key_hash];
   uint64_t texture_hash;
   if (checked.frame == im.frame) {
     texture_hash = checked.texture_hash;
   } else {
+    const uint64_t hash_start = NowNsTextures();
     uint64_t content = key_hash;
     if (base_size) {
       content ^= checked.base.Check(base_data, base_size, im.frame, key_hash, stats_.hash_bytes);
@@ -1964,6 +2106,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     texture_hash = content;
     checked.frame = im.frame;
     checked.texture_hash = texture_hash;
+    stats_.hash_ns += NowNsTextures() - hash_start;
   }
   const uint64_t valid_until =
       std::min(base_size ? checked.base.TrustedUntil(im.frame, key_hash) : UINT64_MAX,
@@ -1979,6 +2122,18 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     if (!job.done.load(std::memory_order_acquire)) {
       // Still streaming in: drawn without it for now.
       ++stats_.pending;
+      {
+        static std::unordered_map<uint64_t, uint32_t> waits;  // bo1-nx debug: textures waited on for long
+        if (++waits[key_hash] == 120) {
+          REXLOG_WARN("[native] texture {:08X} {}x{} format {} still streaming after 120 lookups", base_page << 12,
+                      width, height, uint32_t(format));
+        }
+        if (waits.size() > 4096) waits.clear();
+      }
+      if (VkImageView stand_in = mip_page ? Placeholder(placeholder_signature, fetch, is_signed, key_hash)
+                                          : VK_NULL_HANDLE) {
+        return stand_in;
+      }
       return null_view;
     }
     if (!job.ok) {
@@ -2102,7 +2257,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     // every texture the streamer moves to a new address.
     if (!reuse_image && !force_upload_now &&
         ((im.sync_creates_left && total <= kSyncCreateMaxBytes) ||
-         (total <= kSyncCreateLargeBytes && im.sync_create_bytes_left >= total))) {
+         (total <= im.sync_create_large_limit && im.sync_create_bytes_left >= total))) {
       if (total <= kSyncCreateMaxBytes && im.sync_creates_left) {
         --im.sync_creates_left;
       } else {
@@ -2171,6 +2326,10 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
       stats_.upload_bytes += total;
       im.CountUpload(key_hash, base_page << 12, uint32_t(format), width, height, total,
                      texture_hash);
+      if (VkImageView stand_in = mip_page ? Placeholder(placeholder_signature, fetch, is_signed, key_hash)
+                                          : VK_NULL_HANDLE) {
+        return stand_in;
+      }
       return null_view;
     }
 
@@ -2230,9 +2389,11 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     if (host_format.snorm != VK_FORMAT_UNDEFINED) {
       info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
-    if (!rex::ui::vulkan::util::CreateDedicatedAllocationImage(
-            im.device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal, created->image,
-            created->memory)) {
+    const uint64_t create_start = NowNsTextures();
+    const bool image_ok = im.CreateTextureImage(info, created->image, created->memory, &created->memory_size);
+    stats_.create_ns += NowNsTextures() - create_start;
+    ++stats_.creates_on_ring;
+    if (!image_ok) {
       REXLOG_ERROR("[native] Could not create a {}x{}x{} texture of format {}", width, height,
                    layers, uint32_t(format));
       return null_view;
@@ -2301,7 +2462,19 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
   texture->last_used_frame = im.frame;
   texture->last_used_submission = upload.submission;
   im.last_texture = texture;
+  if (texture) texture->invalidated = false;
   im.last_valid_until = valid_until;
+  if (mip_page) im.placeholders[placeholder_signature] = key_hash;
+  if (im.placeholders.size() > 65536) im.placeholders.clear();
+  VkImageView result = ViewOf(texture, fetch, is_signed);
+  return result ? result : null_view;
+}
+
+VkImageView TextureCache::ViewOf(void* texture_ptr, const xenos::xe_gpu_texture_fetch_t& fetch, bool is_signed) {
+  Impl& im = *impl_;
+  const auto& dfn = im.device->functions();
+  VkDevice d = im.device->device();
+  Texture* texture = static_cast<Texture*>(texture_ptr);
   uint32_t swizzle = GuestToHostSwizzle(fetch.swizzle, texture->host_format_swizzle);
   bool use_signed = is_signed && texture->format_snorm != VK_FORMAT_UNDEFINED;
   uint32_t view_key = (swizzle << 1) | uint32_t(use_signed);
@@ -2320,10 +2493,22 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
   view.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
   VkImageView result = VK_NULL_HANDLE;
   if (dfn.vkCreateImageView(d, &view, nullptr, &result) != VK_SUCCESS) {
-    return null_view;
+    return VK_NULL_HANDLE;
   }
   texture->views.emplace(view_key, result);
   return result;
+}
+
+VkImageView TextureCache::Placeholder(uint64_t signature, const xenos::xe_gpu_texture_fetch_t& fetch, bool is_signed,
+                                      uint64_t except_key) {
+  Impl& im = *impl_;
+  auto p = im.placeholders.find(signature);
+  if (p == im.placeholders.end() || p->second == except_key) return VK_NULL_HANDLE;
+  auto t = im.textures.find(p->second);
+  if (t == im.textures.end() || t->second->stream || !t->second->image) return VK_NULL_HANDLE;
+  t->second->last_used_frame = im.frame;
+  ++stats_.placeholders;
+  return ViewOf(t->second.get(), fetch, is_signed);
 }
 
 VkSampler TextureCache::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,

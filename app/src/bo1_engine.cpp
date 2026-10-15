@@ -21,6 +21,8 @@
 
 #include <fmt/format.h>
 #include <rex/cvar.h>
+
+#include "native/bo1_native_system.h"
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
@@ -349,10 +351,22 @@ REXCVAR_DEFINE_STRING(bo1_debug_exec, "", "bo1",
 REXCVAR_DEFINE_INT32(bo1_debug_exec_delay_s, 20, "bo1",
                      "Debug: seconds after the first cinematic job before bo1_debug_exec is queued");
 // Engine settings (dvars) for the console, as the CoD4 port does (codmw_dvars): set 10 s after the first cinematic job
-// and again every 30 s, in case a map script sets one back. The default turns off what costs the most on the Switch
+// and again every 5 s, in case a map script sets one back. The default turns off what costs the most on the Switch
 // for the least visible loss: dynamic shadows (sm_enable 0: the sun's cascades and the spot lights' maps were ~3,100 of
 // ~4,800 draws a frame in Kino der Toten; the baked shadows of the lightmaps stay), depth of field, distortion, flame
-// effects, shell casings, decals on static models and ragdolls. "name value; name value" ('+' = space).
+// effects, shell casings, decals on static models and ragdolls (texture streaming: bo1_stream_off_in_game).
+// "name value; name value" ('+' = space).
+// Texture streaming (high-detail mips from images.pak) off during gameplay only: it made ~80 new textures a second on
+// the console, the main source of stutter, and its high mips were the rainbow floor in Kino. It cannot simply be set
+// with the other dvars: with r_stream 0 a map load waits forever for the streamer (Mac and console), and writing it
+// while a load runs restarts the streamer each time. So it goes off once the native renderer sees gameplay (300+
+// draws a frame for 5 s) and back on as soon as a loading screen shows (under 100 draws for 1.5 s).
+REXCVAR_DEFINE_BOOL(bo1_stream_off_in_game, true, "bo1",
+                    "Turn texture streaming (r_stream) off during gameplay and back on for loading screens");
+REXCVAR_DEFINE_DOUBLE(bo1_stream_restore_after_s, 1.5, "bo1",
+                      "Seconds a loading screen must last (and r_stream stay changed) before streaming is restored");
+REXCVAR_DEFINE_INT32(bo1_dvars_delay_s, 10, "bo1",
+                     "Seconds after the first cinematic job before bo1_dvars is first applied");
 REXCVAR_DEFINE_STRING(bo1_dvars,
                       "sm_enable 0; r_dof_enable 0; r_distortion 0; r_flameFX_enable 0; cg_brass 0; "
                       "fx_marks_smodels 0; ragdoll_enable 0",
@@ -375,7 +389,72 @@ void QueueCommand(PPCContext& ctx, uint8_t* base, const std::string& command) {
   ctx = saved;
 }
 
+// r_stream's dvar_t (registered at 0x8258E6B0 as an int 0..7, default 7, pointer stored at 0x83CF6850): +0 name,
+// +0x10 type (5 = int), +0x18 current value, +0x28 latched value, +0x38 reset value. Written directly so it takes effect
+// at once: "set r_stream" goes through the command buffer, which the main thread does not run while a map loads, and a
+// load started with streaming off waits forever for the streamer.
+constexpr uint32_t kStreamDvarPointer = 0x83CF6850;
+constexpr uint32_t kStreamDvarName = 0x820D6C3C;
+bool WriteStreamDvar(uint8_t* base, uint32_t value) {
+  auto be32 = [&](uint32_t a) {
+    uint32_t v;
+    std::memcpy(&v, base + a, 4);
+    return __builtin_bswap32(v);
+  };
+  const uint32_t dvar = be32(kStreamDvarPointer);
+  if (!dvar || dvar >= 0xA0000000u || be32(dvar) != kStreamDvarName || be32(dvar + 0x10) != 5) return false;
+  const uint32_t v = __builtin_bswap32(value);
+  std::memcpy(base + dvar + 0x18, &v, 4);
+  std::memcpy(base + dvar + 0x28, &v, 4);
+  return true;
+}
+
+int32_t ReadStreamDvar(uint8_t* base) {
+  auto be32 = [&](uint32_t a) {
+    uint32_t v;
+    std::memcpy(&v, base + a, 4);
+    return __builtin_bswap32(v);
+  };
+  const uint32_t dvar = be32(kStreamDvarPointer);
+  if (!dvar || dvar >= 0xA0000000u || be32(dvar) != kStreamDvarName || be32(dvar + 0x10) != 5) return -1;
+  return int32_t(be32(dvar + 0x18));
+}
+
+void MaybeToggleStreaming(PPCContext& ctx, uint8_t* base) {
+  (void)ctx;
+  if (!REXCVAR_GET(bo1_stream_off_in_game) || !bo1::native::Enabled()) return;
+  // The dvar's own value is the state, so nothing gets out of step whatever changed it.
+  const int32_t value = ReadStreamDvar(base);
+  if (value < 0) return;
+  static uint64_t state_since = 0, value_since = 0;
+  static int last_state = -1;  // 0 loading screen, 1 gameplay, 2 neither
+  static int32_t last_value = -1;
+  if (value != last_value) {
+    value_since = NowNs();
+    last_value = value;
+  }
+  const uint32_t draws = bo1::native::LastFrameDraws();
+  const uint64_t now = NowNs();
+  const int state = draws >= 300 ? 1 : (draws < 100 ? 0 : 2);
+  if (state != last_state) {
+    state_since = now;
+    last_state = state;
+  }
+  if (state == 1 && value != 0 && now - state_since >= 5'000'000'000ull) {
+    if (WriteStreamDvar(base, 0)) REXLOG_INFO("bo1: gameplay ({} draws a frame): texture streaming off", draws);
+  } else if (state == 0 && value != 7 &&
+             now - std::max(state_since, value_since) >=
+                 uint64_t(std::max(REXCVAR_GET(bo1_stream_restore_after_s), 0.0) * 1e9)) {
+    if (WriteStreamDvar(base, 7)) {
+      REXLOG_INFO("bo1: loading screen ({} draws a frame): texture streaming back on (r_stream 7)", draws);
+    }
+  }
+}
+
 void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
+  // All the settings once; afterwards every 5 s all but r_stream*: writing r_stream (even with the same value) while a
+  // map loads restarts the streaming system and the load never finished (reproduced on the Mac and the console).
+  static std::string periodic;
   static const std::string commands = [] {
     std::string list = REXCVAR_GET(bo1_dvars);
     std::replace(list.begin(), list.end(), '+', ' ');
@@ -390,6 +469,7 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
       if (first == std::string::npos) continue;
       item = item.substr(first, item.find_last_not_of(' ') - first + 1);
       out += (out.empty() ? "set " : "; set ") + item;
+      if (item.rfind("r_stream", 0) != 0) periodic += (periodic.empty() ? "set " : "; set ") + item;
     }
     return out;
   }();
@@ -398,11 +478,12 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
   const uint64_t now = NowNs();
   uint64_t expected = 0;
   first_ns.compare_exchange_strong(expected, now);
-  if (now - first_ns.load() < 10'000'000'000ull) return;
+  if (now - first_ns.load() < uint64_t(std::max(REXCVAR_GET(bo1_dvars_delay_s), 0)) * 1'000'000'000ull) return;
   uint64_t last = last_ns.load();
-  if (last && now - last < 30'000'000'000ull) return;
+  if (last && now - last < 5'000'000'000ull) return;
   if (!last_ns.compare_exchange_strong(last, now)) return;
-  QueueCommand(ctx, base, commands);
+  if (last && periodic.empty()) return;
+  QueueCommand(ctx, base, last ? periodic : commands);
   if (!last) REXLOG_INFO("bo1: engine settings queued: {}", commands);
 }
 
@@ -437,6 +518,7 @@ void MaybeInjectDebugCommand(PPCContext& ctx, uint8_t* base) {
 
 REX_HOOK_RAW(sub_825A02B8) {
   MaybeApplyDvars(ctx, base);
+  MaybeToggleStreaming(ctx, base);
   MaybeInjectDebugCommand(ctx, base);
   // Debugging aid: BO1_DEBUG_CINE_JOB_SLEEP_MS=<ms> delays every run of the cinematic job, to reproduce on a fast PC
   // the Switch, where the game (and so this per-frame job) runs at ~8-10 FPS.

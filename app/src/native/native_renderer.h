@@ -55,6 +55,8 @@ struct RendererStats {
   uint64_t textures_pending = 0;
   uint64_t texture_memory_bytes = 0;  // bo1-nx
   uint64_t texture_budget_evictions = 0;  // bo1-nx
+  uint64_t texture_placeholders = 0;  // bo1-nx
+  uint64_t texture_hash_ns = 0, texture_create_ns = 0, texture_creates = 0;  // bo1-nx
   uint64_t textures_replaced = 0;
   uint64_t vertex_bytes_copied = 0;
   uint64_t render_passes = 0;
@@ -63,6 +65,10 @@ struct RendererStats {
   // time of the completed submissions (raw timestamp ticks times the
   // reported period; on NVK for this GPU that reads about 1.6x low).
   uint64_t cpu_ns = 0;
+  // bo1-nx: ring time breakdown (cumulative).
+  uint64_t texture_lookup_ns = 0;
+  uint64_t memexport_ns = 0;
+  uint64_t memexport_copies = 0;
   uint64_t gpu_ns = 0;
   uint64_t gpu_submissions = 0;
   // Frames (swap to swap on the ring thread) longer than 50 and 100 ms, and

@@ -3229,6 +3229,7 @@ void Renderer::Impl::UpdateSystemConstants(bool primitive_polygonal,
 // change, or a render target is created. Consecutive draws almost always share
 // it, and rebuilding it per draw was most of the renderer's CPU time.
 void Renderer::Impl::EmulateMemcpyExport(const reg::VGT_DRAW_INITIATOR& initiator, VulkanShader* vs) {
+  TextureTimer memexport_timer(stats().memexport_ns);
   const RegisterFile& r = *regs;
   auto constant_bits = [&](uint32_t n, uint32_t c) { return r[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_000_X + n * 4 + c]; };
   auto constant = [&](uint32_t n, uint32_t c) {
@@ -3287,6 +3288,7 @@ void Renderer::Impl::EmulateMemcpyExport(const reg::VGT_DRAW_INITIATOR& initiato
   std::memcpy(memory->TranslatePhysical<uint8_t*>(dest_base + index0 * 8),
               memory->TranslatePhysical<const uint8_t*>(source), size_t(bytes));
   ++memexport_copies;
+  ++stats().memexport_copies;
   memexport_bytes += bytes;
   textures.InvalidateRange(dest_base + index0 * 8, uint32_t(bytes));
 }
@@ -5191,11 +5193,16 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
   stats().textures_pending = textures.stats().pending;
   stats().texture_memory_bytes = textures.stats().texture_memory_bytes;
   stats().texture_budget_evictions = textures.stats().budget_evictions;
+  stats().texture_placeholders = textures.stats().placeholders;
+  stats().texture_hash_ns = textures.stats().hash_ns;
+  stats().texture_create_ns = textures.stats().create_ns;
+  stats().texture_creates = textures.stats().creates_on_ring;
   stats().textures_replaced = textures.stats().replaced;
   stats().frame_upload_wait_ns = frame_upload_wait_ns;
   stats().frame_fence_wait_ns = frame_fence_wait_ns;
   stats().frame_drain_wait_ns = frame_drain_wait_ns;
   stats().frame_texture_ns = frame_texture_ns;
+  stats().texture_lookup_ns += frame_texture_ns;
   stats().frame_draws = frame_draw_count;
   stats().frame_stream_wait_ns = frame_stream_wait_ns;
   frame_stream_wait_ns = 0;

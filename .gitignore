@@ -13,6 +13,9 @@
 # Reference repositories cloned for research (see PORTING_RESEARCH.md).
 /refs/
 
+# Gameplay recordings from test sessions.
+/gameplay/
+
 # Build trees, caches, logs.
 /out/
 /build/

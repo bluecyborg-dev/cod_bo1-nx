@@ -133,6 +133,7 @@ constexpr uint32_t kOutputWidth = 1280;
 constexpr uint32_t kOutputHeight = 720;
 
 std::atomic<uint64_t> g_swaps_presented{0};
+std::atomic<uint32_t> g_last_frame_draws{0};
 
 // Big-endian words of a command buffer. In the ring the position wraps around
 // (its size is a power of two); in an indirect buffer it does not.
@@ -629,8 +630,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           s.textures_streamed - reported_render_.textures_streamed,
           s.textures_replaced - reported_render_.textures_replaced,
           s.textures_pending - reported_render_.textures_pending);
-      REXLOG_INFO("[native] texture memory: {} MB, {} freed by the budget since start", s.texture_memory_bytes >> 20,
-                  s.texture_budget_evictions);
+      REXLOG_INFO("[native] texture memory: {} MB, {} freed by the budget since start; {} lookups answered with a "
+                  "predecessor while building",
+                  s.texture_memory_bytes >> 20, s.texture_budget_evictions,
+                  s.texture_placeholders - reported_render_.texture_placeholders);
       {
         std::string uploads = renderer_.TakeTextureUploadReport();
         if (!uploads.empty()) {
@@ -653,6 +656,14 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
                   double(s.setups_built - reported_render_.setups_built) / double(frames),
                   double(s.texture_bindings_built - reported_render_.texture_bindings_built) /
                       double(frames));
+      REXLOG_INFO("[native] per frame: texture lookups {:.1f} ms (hashing {:.1f} ms, {:.1f} images created on the "
+                  "ring {:.1f} ms), {:.1f} memexport copies {:.2f} ms",
+                  double(s.texture_lookup_ns - reported_render_.texture_lookup_ns) / 1e6 / double(frames),
+                  double(s.texture_hash_ns - reported_render_.texture_hash_ns) / 1e6 / double(frames),
+                  double(s.texture_creates - reported_render_.texture_creates) / double(frames),
+                  double(s.texture_create_ns - reported_render_.texture_create_ns) / 1e6 / double(frames),
+                  double(s.memexport_copies - reported_render_.memexport_copies) / double(frames),
+                  double(s.memexport_ns - reported_render_.memexport_ns) / 1e6 / double(frames));
       REXLOG_INFO("[native] per frame: {:.1f} waits for the game, {:.1f} ms waiting",
                   double(waits_ - reported_waits_) / double(frames),
                   double(wait_ns_ - reported_wait_ns_) / 1e6 / double(frames));
@@ -1241,6 +1252,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
 #endif
     if (renderer_ready_) {
       renderer_.Swap(presenter_.get(), swap_frontbuffer_, swap_width_, swap_height_);
+      g_last_frame_draws.store(uint32_t(renderer_.stats().frame_draws), std::memory_order_relaxed);
       MaybeCaptureFrame(swap);
       return;
     }
@@ -1509,6 +1521,8 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
 bool Enabled() { return REXCVAR_GET(bo1_renderer) == "native"; }
 
 uint64_t SwapsPresented() { return g_swaps_presented.load(std::memory_order_relaxed); }
+
+uint32_t LastFrameDraws() { return g_last_frame_draws.load(std::memory_order_relaxed); }
 
 std::unique_ptr<rex::system::IGraphicsSystem> CreateGraphicsSystem() {
   return std::make_unique<NativeGraphicsSystem>();

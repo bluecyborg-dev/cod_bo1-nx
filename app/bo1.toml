@@ -1,18 +1,37 @@
 # ============================================================================
-#  Call of Duty: Black Ops for Nintendo Switch: settings (bring-up build)
+#  Call of Duty: Black Ops for Nintendo Switch: settings
 #
 #  Copy this file to the Switch next to the NRO:
 #      sdmc:/switch/bo1-nx/bo1.toml
 #  It is read at startup. Every key is optional: a missing key keeps the built-in default.
 # ============================================================================
 
-# GPU backend: ReXGlue's Xenos emulation (the only one in this build). Expect a low frame rate.
-gpu_plugin = "xenos"
+# ----------------------------------------------------------------------------
+#  Renderer
+# ----------------------------------------------------------------------------
+# "native" draws the game with Vulkan directly (app/src/native). "xenos" is ReXGlue's emulated Xbox 360 GPU: correct
+# but about 1 FPS on the Switch.
+bo1_renderer = "native"
+
+# Frame rate cap: minimum 60 Hz screen refreshes per frame. 3 = a steady 20 FPS (every frame shown for 50 ms),
+# 2 = 30 FPS (the game cannot hold it yet), 1 = no cap (higher average, uneven frame times).
+bo1_min_frame_vblanks = 3
+
+# ----------------------------------------------------------------------------
+#  Engine settings (the game's own dvars), applied after start-up
+# ----------------------------------------------------------------------------
+# The default turns off dynamic shadows (baked shadows stay), depth of field, distortion, flame effects, shell casings,
+# decals on static models and ragdolls: about two thirds of the GPU work. "dvar value; dvar value".
+# bo1_dvars = "sm_enable 0; r_dof_enable 0; r_distortion 0; r_flameFX_enable 0; cg_brass 0; fx_marks_smodels 0; ragdoll_enable 0"
+
+# High-detail texture streaming off during gameplay (back on for loading screens). Removes most stutter; textures are
+# softer up close. false = the game's own streaming.
+# bo1_stream_off_in_game = true
 
 # ----------------------------------------------------------------------------
 #  Logging (sdmc:/switch/bo1-nx/logs/)
 # ----------------------------------------------------------------------------
-# One of: trace, debug, info, warn, error, critical, off. "info" during bring-up.
+# One of: trace, debug, info, warn, error, critical, off.
 log_level = "info"
 # Keep the synchronous logger: on Horizon a starved async writer can fill its queue and block other threads.
 log_async = false

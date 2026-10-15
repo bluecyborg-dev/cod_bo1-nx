@@ -28,6 +28,10 @@ bool Enabled();
 // Swaps the native renderer has presented since startup (0 when disabled).
 uint64_t SwapsPresented();
 
+// bo1-nx: draws of the last presented frame (0 when disabled), so the engine hooks can tell gameplay (hundreds of
+// draws) from a loading screen (~50).
+uint32_t LastFrameDraws();
+
 std::unique_ptr<rex::system::IGraphicsSystem> CreateGraphicsSystem();
 
 }  // namespace bo1::native

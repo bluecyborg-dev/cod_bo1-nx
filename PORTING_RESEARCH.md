@@ -725,6 +725,75 @@ What was done and what was learned. See README.md for the commands.
   a ready list for BO1: `r_lodScaleSkinned 1; r_lodScaleRigid 1; r_dof_enable 0; cg_brass 0; fx_marks_smodels 0;
   sm_enable 0; ragdoll_enable 0; r_zfar 0; r_glow 0; snd_khz 22`, GPU 460 MHz, RAM 1600, depth prepass skipped.
 
+## 8d. Optimization options (research, 2026-10-15)
+
+Written before changing anything, to choose the next work from evidence. Sources: our Switch logs (run
+`20261015-105917`), masseffect-nx `docs/performance-history.md`, `streaming-io.md`, `cold-start-hitches.md`,
+`frame-handshake.md`, `kernel-waits.md`, `measuring.md`; nfsmw-nx `docs/performance-history.md`, `measuring.md`;
+project8-sw `docs/native-renderer.md`; the CoD4 port's `codmw.toml`; nfsmw-nx PR #27 (deko3d renderer) and
+mesa-switch PR #4 (Mesa 26.2.3 for Horizon).
+
+### Where BO1 stands (Kino der Toten, native renderer, dynamic shadows off)
+
+| Measure | Value |
+|---|---|
+| Frame rate | ~10-11 FPS average; 60-95 % of frames over 50 ms, 30-40 % over 100 ms |
+| Draws per frame | ~800-1,300 (was ~4,800 with dynamic shadows) |
+| Renderer (ring thread) CPU | 64-140 ms per frame = **~60 µs per draw** (NFS:MW/ME: 9-21 µs; ours was ~12 µs before the texture invalidation change) |
+| GPU (as NVK reports; real ≈ ×1.6) | ~30 ms per frame |
+| Worst hitches | 141-613 ms, the renderer **idle 86-518 ms** inside them: the game sent nothing (game-side stall) |
+| SD reads | 280 `[io] SLOW` reads in one session (3.4 s total, worst 45 ms), many `(REREAD)` of `images.pak` / `snd.all.pak` |
+| Texture memory | ~350 MB, no budget evictions |
+
+So there are three separate problems: (1) the ring thread costs ~5x what it should per draw; (2) the game side stalls
+for hundreds of ms at times; (3) frames are not paced (every frame is shown as soon as it is ready).
+
+### What the other ports learned (ranked by what paid off for them)
+
+| Technique | Who | Result there | BO1 status |
+|---|---|---|---|
+| Native renderer, GPU at the official 460.8 MHz profile, 3 work slots, async output | all | 1-3 → 16-29 FPS | done (460 MHz requested) |
+| Fewer draws/passes through game settings | CoD4 port (`sm_enable 0`, no glow/DOF, LOD 1, `snd_khz 22`) | — | done (`bo1_dvars`) |
+| **Skip the game's depth prepass** | ME (`skip_prepass`), CoD4 (`codmw_saltar_prepaso`) | ME: fixed artefacts and cut ~1/3 of scene draws | not done: BO1's prepass is ~675 draws/frame (~45 % of what remains) |
+| **Lower internal resolution, on the 16-pixel tile grid** (game's video mode 960x544) | ME, NFS:MW (deko3d 960x540) | ME 10-14 → 15-17 FPS; NFS 27.7 → 35.2 | not done (BO1 renders 1040x608 with 2x MSAA) |
+| **CPU per draw in the ring**: memo/caches, no allocation or logging per draw, dedupe uploads, deferred recording thread | NFS:MW, ME | ME ring 62 → 40 % busy; NFS 30.3 FPS | regression to fix first (60 µs/draw); `bo1_native_record_thread` exists, off |
+| Frame pacing: swap interval 2 once ~90 % of frames fit in 31 ms; never "present as fast as possible" with ±20 % variance | NFS:MW `measuring.md`, project8 (`min_frame_vblanks 2`, `pace_before_present`) | removes the cadence jitter the player feels | not done; only useful after the frame time is lower |
+| Game busy-waits replaced by real waits; render thread priority | all; ME render thread 0x2B (+1.8 FPS), PhysX poll yield (+1 FPS) | +5-10 % | partly (bo1 idle hooks); priorities not tuned |
+| Codegen: **direct calls** (bypass weak aliases), non-volatile registers as locals (+9 %), "diet" ops (main thread -10 %) | NFS:MW, ME | NFS 30 → 34 FPS with LTO/PGO; ME +9 %, -10 % | not done (calls go through `sub_X` weak aliases; `non_volatile_as_local` blocked by setjmp in Com_Error) |
+| Guest memory without `volatile` | ME (+15-20 %) | | already in our SDK |
+| LTO / PGO / function ordering | NFS:MW yes (+~4 FPS with direct calls); ME no gain | mixed | not done |
+| **Streaming I/O**: rereads of archives correlate with hitches; range cache of reread ranges | ME (`streaming-io.md`, `masseffect_io_ranges_mb`) | hitch correlation 26-60 % vs 8-31 % random | we see the same `(REREAD)` pattern; cache off |
+| Pipeline prewarm / driver pipeline cache on SD | ME, project8 | cold hitches of 1-5 s removed | driver cache on; no prewarm list |
+| Native replacements of the hottest game functions (with guards) | NFS:MW (+1.4 FPS, -70 % of 60 ms frames), ME (0.1-0.8 ms each) | | not done; needs a profile first |
+| Offline shader library (XenosRecomp + DXC) instead of the runtime translator | NFS:MW, ME | leaner shaders, no runtime compiles | not done; big job |
+| Kernel wait costs (SDK `notify_all`, mallocs per wait) | ME `kernel-waits.md` | one guest timer thread at 92 % of a core | unknown for BO1 (needs a stack profile) |
+| Newer Mesa for Horizon (26.2.3: ZCULL on, less shader-cache lock contention, no redundant UBO updates) | mesa-switch PR #4 | per-draw and compile CPU down | we pin ME's older Mesa `d4a00ea0ab3` |
+| deko3d renderer instead of NVK | nfsmw-nx PR #27 (branch) | 27.7 vs 26.2 FPS, **frames ≥100 ms 4.5 → 1.0 per minute**, NRO 63 → 40 MB | long-term option |
+| Overclock | all | hides problems | rejected as a target; measure at stock |
+
+What did **not** pay off elsewhere: lower resolution on a CPU-bound frame, resolutions off the 16-px grid, batching
+barriers, arguments in registers on top of locals, LTO in ME, more swapchain images, a separate presentation thread
+(higher average but 3x wider frame-time range).
+
+### Measuring rules to adopt (from NFS:MW and ME)
+
+- Stock clocks only; one change per run behind a setting; A/B back to back in one session (noise ~3 FPS).
+- Report the share of frames over 33.3 / 50 ms and the range, not only the average.
+- For CPU work, core-ms per frame; know which thread is the limit (ring, game main, render, streaming).
+- The SDK stack profiler (`logs/rex/stacks_profile.flag` next to the NRO) answers "which thread / function".
+
+### Recommended order for BO1
+
+1. **Fix the ring regression** (60 → ~12 µs/draw): profile the ring thread; `InvalidateRange` scans every texture
+   range per memcpy copy (~40 a frame), sync texture creation runs on the ring. Expected: ~2x frame rate on its own.
+2. **Find the game-side stalls** with the stack profiler (which guest thread, which function, I/O or waits).
+   Likely: streaming reads (range cache), kernel waits, thread priorities.
+3. **Skip the depth prepass** (~675 draws) and try **960x544** (or BO1's own lower video mode): cut both CPU and GPU.
+4. **Frame pacing**: cap at 30 (`min_frame_vblanks 2`, pace before present) only once ~90 % of frames fit 31 ms;
+   before that, a 20 FPS cap (3 vblanks) may feel steadier than free-running 10-20 FPS.
+5. Codegen speed-ups (direct calls first; then diet ops; LTO/PGO as an experiment).
+6. Longer term: newer Mesa (26.2.3), native hot functions, offline shader library, deko3d.
+
 ## 9. Glossary (short)
 
 ReXGlue: Xbox 360 static recompilation SDK (codegen + Xenia-derived runtime). · XenonRecomp/XenosRecomp:

@@ -111,6 +111,10 @@ struct TextureCacheStats {
   uint64_t live_textures = 0;
   uint64_t texture_memory_bytes = 0;  // bo1-nx: counted textures, refreshed every 60 frames
   uint64_t budget_evictions = 0;      // bo1-nx: textures freed by the memory budget
+  uint64_t placeholders = 0;          // bo1-nx: lookups answered with a predecessor while building
+  uint64_t hash_ns = 0;               // bo1-nx: time hashing guest texture data
+  uint64_t create_ns = 0;             // bo1-nx: time creating images on the ring thread
+  uint64_t creates_on_ring = 0;       // bo1-nx
   // Lookups answered with the empty texture: still streaming in, or a format
   // or dimension not handled (logged once each).
   uint64_t pending = 0;
@@ -172,10 +176,15 @@ class TextureCache {
   static std::vector<VkImageCopy> VolumeRegions(const ResolveDestination& dest, uint32_t w, uint32_t h, uint32_t depth,
                                                 bool tiled, uint32_t pitch);
   void CopyToSized(ResolveDestination& dest, VkCommandBuffer commands);
+  // bo1-nx: a view of a texture (opaque Texture*) for a fetch.
+  VkImageView ViewOf(void* texture, const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch, bool is_signed);
+  // bo1-nx: the predecessor of a texture still being built (see Impl::placeholders), or null.
+  VkImageView Placeholder(uint64_t signature, const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch,
+                          bool is_signed, uint64_t except_key);
   // bo1-nx: an uncompressed 3D texture from guest memory (null if not handled).
   VkImageView GetVolumeView(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch, VkFormat host_format,
                             uint32_t host_format_swizzle, uint32_t width, uint32_t height, uint32_t depth,
-                            uint32_t base_page, UploadTarget& upload);
+                            uint32_t base_page, UploadTarget& upload, bool as_2d_array);
   // bo1-nx: textures reading [start, start + bytes) check their data in full on their next use.
   void InvalidateRange(uint32_t start, uint32_t bytes);
   // Copies a rectangle between two views on the GPU without vkCmdCopyImage,

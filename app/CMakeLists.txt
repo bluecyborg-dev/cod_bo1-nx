@@ -24,7 +24,8 @@ add_executable(bo1
     src/native/bo1_native_system.cpp
     src/native/native_renderer.cpp
     src/native/native_textures.cpp
-    src/native/native_geometry_shaders.cpp)
+    src/native/native_geometry_shaders.cpp
+    src/native/texture_pool.cpp)
 target_include_directories(bo1 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     # The SDK's prebuilt SPIR-V (the gamma-applying swap shader) and glslang's SPIR-V builder, which the translator
