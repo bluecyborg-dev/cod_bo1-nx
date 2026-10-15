@@ -1,0 +1,42 @@
+# Game files supplied by the user (copyrighted). Never commit them or anything made from them.
+*.iso
+*.xex
+*.xexp
+/assets/
+/game/
+/game_root/
+/extracted/
+
+# Code generated from the game's program by the ReXGlue code generator.
+/app/generated/
+
+# Reference repositories cloned for research (see PORTING_RESEARCH.md).
+/refs/
+
+# Build trees, caches, logs.
+/out/
+/build/
+/sdk/out/
+*.log
+
+# SDK third-party sources are fetched by tools/fetch_thirdparty.py; only the files the fork changed are tracked.
+/sdk/thirdparty/*
+!/sdk/thirdparty/CMakeLists.txt
+!/sdk/thirdparty/FFmpeg
+/sdk/thirdparty/FFmpeg/*
+!/sdk/thirdparty/FFmpeg/config.h
+!/sdk/thirdparty/FFmpeg/config_switch_aarch64.h
+!/sdk/thirdparty/FFmpeg/config_masseffect_wmv3.h
+!/sdk/thirdparty/FFmpeg/libavcodec
+/sdk/thirdparty/FFmpeg/libavcodec/*
+!/sdk/thirdparty/FFmpeg/libavcodec/mdct_template.c
+!/sdk/thirdparty/FFmpeg/libavcodec/fft_template.c
+!/sdk/thirdparty/ffmpeg-overlay
+/sdk/thirdparty/ffmpeg-overlay/*
+!/sdk/thirdparty/ffmpeg-overlay/codec_list.c
+
+# Host clutter.
+.DS_Store
+__pycache__/
+*.pyc
+/cache/

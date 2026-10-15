@@ -1,0 +1,72 @@
+# Analysis overrides for default.xex (campaign + Zombies), title 41560855, media 0AEB2159, base version.
+#
+# Every entry documents why it is needed. Included files use the flat schema (sections at the root).
+# Loose keys must stay ABOVE the first [table]: in TOML a key written after [functions] belongs to it,
+# and the code generator would ignore it silently.
+
+# --- setjmp / longjmp (CRT) ------------------------------------------------------------------------
+# The engine uses them in Com_Error to return to the main loop after a recoverable error. Without them
+# the recompiled code cannot unwind and the game ends instead of recovering.
+# Found with refs/bo1-recomp/tools/find_setjmp.py on our decrypted image, checked by disassembly:
+#   setjmp  0x825FB3A0: checks a hook pointer (lis r4/lwz/bnectr), mflr r0, mfcr r4, then stfd f14..f31 to r3.
+#   longjmp 0x825FB7A0: r3 = jmp_buf, r4 = value; lwz r3,0x134(r7) / lwz r4,0x90(r7) / bl 0x82603550 (unwind),
+#                       then lfd f14..f31 and ld r13..r31 from the buffer.
+# Same code as bo1-recomp's base build (0x825FB540 / 0x825FB940), shifted by -0x1A0, also 0x400 apart.
+setjmp_address = 0x825FB3A0
+longjmp_address = 0x825FB7A0
+
+# --- Registers as C++ locals ----------------------------------------------------------------------
+# The same set bo1-recomp uses on PC for this game:
+#   skip_msr          : MSR is only used by interrupt-disable regions
+#   ctr_as_local      : CTR never survives a call
+#   xer_as_local      : XER is volatile across calls
+#   reserved_as_local : the lwarx/stwcx. reservation starts and ends in the same function
+#   cr_as_local       : condition registers
+# non_volatile_as_local and skip_lr are NOT enabled: setjmp/longjmp (Com_Error) and the SEH blocks need
+# r14-r31 and LR in ctx.
+skip_msr = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+
+[functions]
+# Filled in from codegen warnings and runtime "Call to invalid or unregistered function" errors.
+
+# 2-instruction leaf setter (stw r4,0x20(r3); blr) right after a bctr, only reached by a tail jump
+# (b 0x8239C0D0 from 0x824430A0). Codegen: "UnresolvedCall 0x8239C0D0 - target not in any function".
+# It is bo1-recomp's 0x8239BE70 (base 0.0.0.8 build) / 0x82381E28 (TU11).
+0x8239C0D0 = { size = 8 }
+
+# --- Functions only referenced from vtables / data (no branch reaches them) ---
+# Found with refs/bo1-recomp/tools/find_missing_funcs.py + classify_candidates.py on our image (the same
+# 28 entries and 17 dropped SEH blocks as bo1-recomp's own list, at shifted addresses). SEH funclets
+# (__except/__finally using r31 as frame) are deliberately NOT declared.
+0x821B2EC0 = {}               # func: lhz r11, 0x216(r3)
+0x82211198 = {}               # func: lis r10, -0x7d46
+0x82248450 = {}               # func: lwz r11, 0xbc4(r3)
+0x8239BE80 = { size = 4 }     # thunk: b 0x8238cce8
+0x824F7D00 = { size = 8 }     # thunk: addi r3, r3, -8
+0x824FBD68 = { size = 8 }     # thunk: addi r3, r3, -4
+0x824FBD70 = { size = 8 }     # thunk: addi r3, r3, -4
+0x824FBD78 = { size = 8 }     # thunk: addi r3, r3, -4
+0x824FBD88 = { size = 8 }     # thunk: addi r3, r3, -4
+0x824FBD90 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82501D18 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82501D20 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82501D30 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82501D38 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82501D40 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82501D48 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82501D50 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82501D58 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82501FF0 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82502000 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82502008 = { size = 8 }     # thunk: addi r3, r3, -4
+0x82502010 = { size = 8 }     # thunk: addi r3, r3, -4
+0x825070F8 = { size = 24 }    # thunk: lwz r11, 0x48(r3)
+0x82507EB0 = { size = 8 }     # thunk: addi r3, r3, -0x10
+0x82508B30 = { size = 8 }     # thunk: addi r3, r3, -0x20
+0x8250B8A0 = {}               # func: lhz r11, 0x28(r3)
+0x8250BB58 = { size = 8 }     # thunk: addi r3, r3, -0x20
+0x8251A7C8 = { size = 8 }     # thunk: addi r3, r3, -4

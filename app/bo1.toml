@@ -1,0 +1,26 @@
+# ============================================================================
+#  Call of Duty: Black Ops for Nintendo Switch: settings (bring-up build)
+#
+#  Copy this file to the Switch next to the NRO:
+#      sdmc:/switch/bo1-nx/bo1.toml
+#  It is read at startup. Every key is optional: a missing key keeps the built-in default.
+# ============================================================================
+
+# GPU backend: ReXGlue's Xenos emulation (the only one in this build). Expect a low frame rate.
+gpu_plugin = "xenos"
+
+# ----------------------------------------------------------------------------
+#  Logging (sdmc:/switch/bo1-nx/logs/)
+# ----------------------------------------------------------------------------
+# One of: trace, debug, info, warn, error, critical, off. "info" during bring-up.
+log_level = "info"
+# Keep the synchronous logger: on Horizon a starved async writer can fill its queue and block other threads.
+log_async = false
+# Log file written by a dedicated thread through a lock-free ring, so game threads never touch the SD card.
+log_nonblocking = true
+
+# ----------------------------------------------------------------------------
+#  Input
+# ----------------------------------------------------------------------------
+# false (default) = buttons by letter (Switch A = Xbox A). true = by position, as on an Xbox pad.
+# input_xbox_layout = false

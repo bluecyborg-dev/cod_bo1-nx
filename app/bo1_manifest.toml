@@ -1,0 +1,22 @@
+# ReXGlue recompilation manifest for Call of Duty: Black Ops (Xbox 360), campaign + Zombies executable
+# (default.xex), for the Nintendo Switch.
+#
+# The project name sets the prefix of everything generated: generated/default/bo1_{init,pch,funcs}.h,
+# bo1_recomp.N.cpp, and the CMake target bo1_recomp built by CMakeLists.txt.
+#
+# Input: your own disc's default.xex in ../assets (tools/extract_iso.py --xex-only). Supported executable:
+#   default.xex SHA-256 6027bd4fa4edc750fc60f544ef51feca766290f8a2785e91ebdda6368f281851
+#   title 41560855, media 0AEB2159, base version (no Title Update). This is NOT the build bo1-recomp's
+#   config/default.toml was written for (its addresses are shifted, see PORTING_RESEARCH.md).
+
+[project]
+name = "bo1"
+sdk_version = "0.10.0"
+game_root = "../assets"
+
+[entrypoint]
+file_path = "../assets/default.xex"
+out_directory_path = "generated/default"
+
+# overrides.toml: written by hand, code the automatic discovery misses and codegen options, each with its evidence.
+includes = ["overrides.toml"]
