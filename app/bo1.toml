@@ -20,9 +20,14 @@ bo1_min_frame_vblanks = 3
 # ----------------------------------------------------------------------------
 #  Engine settings (the game's own dvars), applied after start-up
 # ----------------------------------------------------------------------------
-# The default turns off dynamic shadows (baked shadows stay), depth of field, distortion, flame effects, shell casings,
-# decals on static models and ragdolls: about two thirds of the GPU work. "dvar value; dvar value".
-# bo1_dvars = "sm_enable 0; r_dof_enable 0; r_distortion 0; r_flameFX_enable 0; cg_brass 0; fx_marks_smodels 0; ragdoll_enable 0"
+# The default turns off depth of field, distortion, flame effects, shell casings, decals on static models and
+# ragdolls. "dvar value; dvar value".
+# bo1_dvars = "r_dof_enable 0; r_distortion 0; r_flameFX_enable 0; cg_brass 0; fx_marks_smodels 0; ragdoll_enable 0"
+
+# Dynamic shadows (baked shadows always stay). "off" is fastest, but the hands and characters flicker between lit and
+# dark when moving near lights; "lite" keeps one spot light and a short sun shadow range, world casters only, at low
+# quality; "full" is the game's own (much slower).
+# bo1_shadows = "off"
 
 # High-detail texture streaming off during gameplay (back on for loading screens). Removes most stutter; textures are
 # softer up close. false = the game's own streaming.

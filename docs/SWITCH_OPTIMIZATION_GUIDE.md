@@ -107,6 +107,14 @@ empty (BO1: scene drawn as `k_8_8_8_8_GAMMA`, resolved as `k_8_8_8_8` → black 
 **Fix:** formats that map to the same host VkFormat share an image (canonical key). Mass Effect needed the full
 "mode 4" (per-tile ownership + transfers) because UE3 reinterprets HDR words across formats.
 
+### 3.1b A target can start inside another one
+
+BO1 draws its 1024x2048 sun shadow map in two halves: the top at EDRAM base 384, the bottom by moving the base to
+1216 (inside the first target), then resolves all 2048 rows from base 384. A renderer with one image per base never
+resolves the bottom half. Trace the passes of a frame with shadows on and look for a depth-only pass whose base falls
+inside another target of the same pitch: either draw it into that image at a row offset, or (if it was never visible
+anyway) skip it.
+
 ### 3.2 Clears and resolves through a 4x view at half the pitch
 
 Xbox D3D clears a 2x (or 1x) surface by drawing one rectangle into a **4x MSAA view at half the pitch**, which covers the
@@ -185,6 +193,16 @@ top bits 01, index/format/count as floats in [2^23, 2^24)) and do the copy on th
 - Write only the vertex outputs the pixel shader reads (ME: scene 66 → 36.6 ms).
 - Pipelines: prewarm known pipelines at boot, keep the driver cache on SD, per-stage NVK cache keys; asynchronous
   pipeline creation causes pop-in.
+- Cache the translated SPIR-V too, not just the driver's pipelines: translation of a Xenos shader costs far more
+  than `vkCreateShaderModule`. Key each record by shader type, microcode hash and modification, and store the
+  texture and sampler bindings with it: the SPIR-V translator fills the shader's binding lists as a side effect of
+  the first translation, so a hit that only restores the binary leaves the shader with no bindings. Append records
+  with a checksum each and stop reading at the first bad one (write the next record over it); key the file by
+  vendor, device and driver version plus a version number bumped when the translator changes.
+- With the SPIR-V cached, pipelines can be built before the game asks: save every pipeline key (shader identities
+  with modifications, layout counts, geometry shader key, fixed state) and compile the list at boot on the worker,
+  behind any pipeline a draw is waiting for. Build the key so it alone is enough to create the pipeline. BO1: 62
+  compile-linked slow frames per session → 21 with the SPIR-V cache alone.
 - Metal (MoltenVK on a Mac) lacks geometry shaders: rectangle lists and point sprites are skipped there, which also
   drops D3D's clears. Keep the Mac for logic and most rendering bugs, but verify on the console.
 
@@ -269,6 +287,11 @@ top bits 01, index/format/count as floats in [2^23, 2^24)) and do the copy on th
 
 ## 7. What did not work (here or in the other ports)
 
+- Turning a game system off with a dvar can leave its shaders reading stale data: BO1 with `sm_enable 0` lit models
+  from shadow data that was no longer drawn, and they alternated between lit and dark every frame near lights. Keep
+  the system on and shrink what it draws instead (fewer lights, fewer casters, shorter range). Check each dvar with a
+  frame trace: some are registered but unused (`sm_sunEnable`, `sm_spotEnable` in BO1).
+
 | Idea | Result |
 |---|---|
 | The SDK's emulated Xenos GPU on Switch | 1-3 FPS and crashes (page watching faults + lost vector registers) |
@@ -314,4 +337,7 @@ top bits 01, index/format/count as floats in [2^23, 2^24)) and do the copy on th
 - GDC 2019 "Witcher 3 on the Nintendo Switch: CPU & Memory Optimization" (slides behind GDC Vault).
 - nfsmw-nx PR #27 (deko3d renderer); mesa-switch PR #4 (Mesa 26.2.3 for Horizon); Phoronix on NVK ZCULL.
 - Digital Foundry / Nintendo Life on boost mode in loading screens; Engadget on Wolfenstein II's dynamic resolution.
+- sa2-nx `docs/porting-guide.md`, `enhancements.md`, `gpu-optimisation-candidates.md`; futari-nx `xbox360.md` (five
+  ports' shared notebook); UnleashedRecomp-NX `docs/SWITCH-PERFORMANCE.md`; the-simpsons-game-nx Mesa patches.
+  Summarised and ranked for this port in `docs/OTHER_PORTS_RESEARCH.md`.
 - This repository: `PORTING_RESEARCH.md` (§8b-8d), `OPTIMIZATION_PLAN.md`, `app/src/native/`, `app/src/bo1_engine.cpp`.

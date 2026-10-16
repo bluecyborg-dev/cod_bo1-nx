@@ -48,6 +48,7 @@ struct RendererStats {
   uint64_t resolves = 0;
   uint64_t pipelines_created = 0;
   uint64_t shaders_translated = 0;
+  uint64_t shaders_from_cache = 0;  // of shaders_translated, taken from the SPIR-V cache
   uint64_t textures_uploaded = 0;
   uint64_t texture_bytes_uploaded = 0;
   uint64_t textures_created = 0;
@@ -127,6 +128,10 @@ class Renderer {
   // Loads the driver's compiled pipelines saved by an earlier session, and
   // saves them there as new ones appear. Call before the guest starts.
   void InitializeDriverCache(const std::filesystem::path& cache_root, uint32_t title_id);
+  // Loads the SPIR-V translated by earlier sessions from the same directory (called by InitializeDriverCache).
+  void InitializeSpirvCache(const std::filesystem::path& directory, uint32_t title_id);
+  // Compiles, on the pipeline worker, the pipelines earlier sessions made (called by InitializeDriverCache).
+  void PrewarmPipelines(const std::filesystem::path& directory, uint32_t title_id);
 
   // The 256-entry gamma ramp, as the DC_LUT_30_COLOR register packs it.
   void SetGammaRamp256(const uint32_t* entries);

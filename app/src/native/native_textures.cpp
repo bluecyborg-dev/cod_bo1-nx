@@ -493,6 +493,11 @@ struct StreamJob {
   bool ok = false;
 };
 
+REXCVAR_DEFINE_UINT32(bo1_native_dynamic_texture_changes, 4, "BO1",
+                      "Native renderer: textures whose data changed this many times are hashed in full every frame "
+                      "(per-frame CPU data such as model lighting); 0 = sampled like the rest");
+REXCVAR_DEFINE_BOOL(bo1_native_full_texture_hash, false, "BO1",
+                    "Native renderer diagnostics: hash all texture and vertex data in full every frame");
 REXCVAR_DEFINE_UINT32(bo1_native_texture_budget_mb, 768, "BO1",
                       "Native renderer: GPU memory for textures before the least recently used are freed (0 = no "
                       "limit)");
@@ -562,7 +567,9 @@ struct TextureCache::Impl {
     uint64_t texture_hash = 0;
     ChangeDetector base;
     ChangeDetector mips;
+    bool dynamic_logged = false;
   };
+  uint32_t dynamic_logged = 0;
   FlatMap64<Checked> checked;
   // bo1-nx: the guest memory each texture layout reads (base and mips), so a CPU write the renderer knows about
   // (BO1's GPU memcpy, done on the CPU) can make the textures over it check their data on the next use.
@@ -961,6 +968,8 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
   im.device = device;
   im.memory = memory;
   im.pool.Init(device, int32_t(REXCVAR_GET(bo1_native_texture_budget_mb)));
+  ChangeDetector::dynamic_changes = REXCVAR_GET(bo1_native_dynamic_texture_changes);
+  ChangeDetector::always_full = REXCVAR_GET(bo1_native_full_texture_hash);
   im.max_anisotropy =
       device->properties().samplerAnisotropy
           ? std::min({16.0f, device->properties().maxSamplerAnisotropy,
@@ -2107,6 +2116,16 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     checked.frame = im.frame;
     checked.texture_hash = texture_hash;
     stats_.hash_ns += NowNsTextures() - hash_start;
+    // Which textures the game rewrites in place, the first few times one becomes dynamic.
+    const uint32_t dynamic = ChangeDetector::dynamic_changes;
+    if (dynamic && (checked.base.changes() == dynamic || checked.mips.changes() == dynamic) &&
+        !checked.dynamic_logged && im.dynamic_logged < 24) {
+      checked.dynamic_logged = true;
+      ++im.dynamic_logged;
+      REXLOG_INFO("[native] texture {:08X} ({}x{}x{}, format {}, {} KB) changes often: hashed in full every frame",
+                  base_page << 12, key.width_minus_1 + 1, key.height_minus_1 + 1, key.depth_or_array_size_minus_1 + 1,
+                  uint32_t(key.format), (base_size + mip_size) >> 10);
+    }
   }
   const uint64_t valid_until =
       std::min(base_size ? checked.base.TrustedUntil(im.frame, key_hash) : UINT64_MAX,

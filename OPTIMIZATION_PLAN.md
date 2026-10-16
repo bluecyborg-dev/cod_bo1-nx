@@ -60,13 +60,19 @@ arguments in registers on top of locals, more swapchain images, a separate prese
 | `r_stream 0` (no high-mip streaming) | first minute: renderer 19-27 ms, ~0 frames over 100 ms, video 20.1 FPS; rainbow floor gone. Opening a door (new area) brings the copies and texture creation back (16-44 copies/frame); video 17.7 FPS |
 | `r_stream 0` in the dvars, re-applied every 5 s | **froze on the loading screen** (console and Mac): with streaming off a map load waits forever for the streamer, and rewriting it during a load restarts it |
 | `bo1_stream_off_in_game` via `set r_stream` | froze again on the console: BO1's 3D main menu (~1,500 draws) looked like gameplay, streaming went off in the menu, and `set r_stream 1` at the loading screen never ran (the command buffer does not run during a load) |
-| Now testing | r_stream written **directly** in its dvar (`0x83CF6850` → dvar, current value at +0x18, latched +0x28; int 0..7, default 7); the dvar's own value is the state. Mac: a load started with streaming off and stuck resumes as soon as 7 is written. Plus the 20 FPS cap |
+| r_stream written **directly** in its dvar (`0x83CF6850` → dvar, current value at +0x18, latched +0x28; int 0..7, default 7) | loads work (menu off → load → restored → loaded), Mac and console. Docked: 179-200 swaps per 10 s at the 20 FPS cap, renderer 15-25 ms, GPU 15-20 ms; the slow frames left line up with shader and pipeline compiles (~509 shaders, ~436 pipelines a session) |
+| **SPIR-V cache** on the SD card (2nd console session) | 462 of 511 shaders from the cache (38 MB loaded at boot, ~0.7 s); slow frames during a compile 62 → 21 per session, the rest mostly pipelines. The 77-swap window was the pause menu (~620 draws, GPU ~40 ms each) |
+| **Pipeline list + prewarm**: every pipeline key is appended to `native-*.pipelines`; at boot they are compiled on the worker (draw requests first) with modules from the SPIR-V cache | console: 510 pipelines prewarmed in 766 ms at boot; slow frames during a compile per session 62 (no caches) → 21 (SPIR-V cache) → 14 (list being written) → **2** (prewarm); 491 of 496 shaders cached; play 170-200 swaps per 10 s |
+| (before) | **SPIR-V cache** on the SD card (`cache/shaders/driver/native-*.spirv`, next to the driver cache): every translation is appended with its texture/sampler bindings and a checksum, and later sessions skip translating. Mac: 2nd run took 228 of 235 shaders from the cache, same draw counts; ~55 KB per shader (13 MB for Kino on the Mac) |
 
 Even without churn a frame is ~50 ms (renderer ~25 ms, GPU ~30 ms as reported ≈ 48 ms real): 20 FPS is the stable
 target today; 30 needs the GPU and the ring ~40 % lighter (depth prepass skip, 960x544). BO1 has no dvar for the
 prepass, so skipping it is renderer work.
 
 ## Order of work
+
+See also `docs/OTHER_PORTS_RESEARCH.md` (2026-10-15): what sa2-nx, futari-nx, UnleashedRecomp-NX and the R-drg ports
+measured, ranked for BO1. Its first step is a console CPU profile in Kino.
 
 1. **Ring thread back to ~12 µs per draw** (in progress). Done: page-indexed texture invalidation (was millions of
    comparisons a frame), placeholders while a texture builds. Measuring now: texture lookup time split into hashing
@@ -85,6 +91,14 @@ Known visual issues to revisit after performance (from play and the videos in `g
   effect behind them (bloom, sprite scale or exposure).
 - The round platform in the lobby shows an oily rainbow swirl: a reflection (cube) texture or its mips read wrong.
 - Sunlight flickers when firing (muzzle flash light).
+- Characters and the hands flickered between lit and dark when crossing between dark and lit areas (video 18:00:
+  hand brightness 76/26/54/62/25/53 on consecutive frames, bursts of 1-4 s). Cause: `sm_enable 0`. With the shadow
+  system on the flicker is gone (console, 3 sessions). Full shadows cost 11-15 fps, so `bo1_shadows=lite` keeps the
+  system on but draws almost nothing: one spot light, world casters only, sun shadow range x0.25. In this build
+  `sm_sunEnable`, `sm_spotEnable` and `r_spotLightShadows` do nothing; `sm_maxLights` and the sun scale dvars work.
+  The sun shadow map is 1024x2048 drawn in two halves at EDRAM bases 384 and 1216 (inside the first) and resolved
+  from 384: our separate image per base meant the far half (~2,300 draws, ~620 with lite) was never resolved;
+  `bo1_native_skip_aliased_depth` skips it. Mac draws per 10 s: off 310k, full ~890k, lite 340k.
 - Occasional black textures while streaming.
 
 Frame rate measured from the videos (distinct frames of a 30 FPS capture, build before the texture pool):

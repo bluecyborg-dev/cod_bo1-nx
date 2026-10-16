@@ -787,6 +787,15 @@ class Shader {
     // May be empty if the host does not support disassembly.
     const std::string& host_disassembly() const { return host_disassembly_; }
 
+    // bo1-nx: marks the translation done with a binary produced earlier by the same translator (the native renderer's
+    // SPIR-V cache on the SD card), instead of translating again.
+    void SetTranslatedBinary(std::vector<uint8_t> binary) {
+      translated_binary_ = std::move(binary);
+      errors_.clear();
+      is_translated_ = true;
+      is_valid_ = true;
+    }
+
     // In case disassembly depends on the GPU backend, for setting it
     // externally.
     void set_host_disassembly(std::string disassembly) {

@@ -58,6 +58,21 @@ class SpirvShader : public Shader {
     return sampler_bindings_;
   }
 
+  // bo1-nx: the binding lists a translation would set up, for a translation taken from the native renderer's SPIR-V
+  // cache. Like the translator, only the first caller sets them.
+  void SetBindingsFromCache(const TextureBinding* textures, size_t texture_count,
+                            const SamplerBinding* samplers, size_t sampler_count) {
+    if (bindings_setup_entered_.test_and_set(std::memory_order_relaxed)) {
+      return;
+    }
+    texture_bindings_.assign(textures, textures + texture_count);
+    used_texture_mask_ = 0;
+    for (const TextureBinding& binding : texture_bindings_) {
+      used_texture_mask_ |= UINT32_C(1) << binding.fetch_constant;
+    }
+    sampler_bindings_.assign(samplers, samplers + sampler_count);
+  }
+
  protected:
   Translation* CreateTranslationInstance(uint64_t modification) override;
 

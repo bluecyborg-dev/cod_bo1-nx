@@ -5,4 +5,4 @@ Copied from project8-sw (R-drg, `src/game/src/native/`), which adapted it from n
 
 Changes for BO1: names (`thps_*` settings → `bo1_*`, namespace `thps` → `bo1`), the pacing counters header
 (`../bo1_pacing_stats.h`). Everything else is as upstream; see project8-sw's `docs/native-renderer.md` for the design.
-Selected with `bo1_renderer = "native"`; the default stays the SDK's emulated GPU (`xenos`).
+Selected with `bo1_renderer = "native"` (the default); `xenos` is the SDK's emulated GPU.

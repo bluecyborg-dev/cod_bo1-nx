@@ -68,7 +68,7 @@ REXCVAR_DEFINE_INT32(bo1_native_ring_core, -1, "BO1",
 REXCVAR_DEFINE_BOOL(bo1_pace_before_present, false, "BO1",
                     "Hold a frame for the frame rate cap before presenting it rather than "
                     "after, so frames go on screen evenly spaced");
-REXCVAR_DEFINE_UINT32(bo1_min_frame_vblanks, 1, "BO1",
+REXCVAR_DEFINE_UINT32(bo1_min_frame_vblanks, 3, "BO1",
                       "Native renderer: minimum 60 Hz vblanks between frames (1 = the game's "
                       "own pacing, 2 = an even 30 fps)");
 
@@ -79,7 +79,7 @@ REXCVAR_DEFINE_UINT32(bo1_debug_capture_every, 0, "BO1",
                       "Debug: save every Nth presented frame to bo1_debug_capture_dir (0 = off)");
 REXCVAR_DEFINE_STRING(bo1_debug_capture_dir, "", "BO1", "Debug: folder for bo1_debug_capture_every");
 
-REXCVAR_DEFINE_STRING(bo1_renderer, "xenos", "BO1",
+REXCVAR_DEFINE_STRING(bo1_renderer, "native", "BO1",
                       "xenos = the SDK's emulated Xbox 360 GPU; native = the native renderer "
                       "(in development: stage A presents a test colour)")
     .allowed({"xenos", "native"})
@@ -616,11 +616,11 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       const RendererStats& s = renderer_.stats();
       REXLOG_INFO(
           "[native] renderer: {} drawn, {} skipped, {} resolves, {} passes, {} submissions, "
-          "{} shaders, {} pipelines, {} textures ({} MB), {} MB vertices",
+          "{} shaders ({} cached), {} pipelines, {} textures ({} MB), {} MB vertices",
           s.draws - reported_render_.draws, s.draws_skipped - reported_render_.draws_skipped,
           s.resolves - reported_render_.resolves, s.render_passes - reported_render_.render_passes,
           s.submissions - reported_render_.submissions, s.shaders_translated,
-          s.pipelines_created, s.textures_uploaded - reported_render_.textures_uploaded,
+          s.shaders_from_cache, s.pipelines_created, s.textures_uploaded - reported_render_.textures_uploaded,
           (s.texture_bytes_uploaded - reported_render_.texture_bytes_uploaded) >> 20,
           (s.vertex_bytes_copied - reported_render_.vertex_bytes_copied) >> 20);
       REXLOG_INFO(

@@ -72,6 +72,7 @@ extern "C" {
 // project8-sw's SDK can compile texture signs into each pipeline (gpu_specialize_texture_signs, off by default); our
 // SDK's translator can't, so the signs are always selected at run time.
 REXCVAR_DECLARE(std::string, bo1_debug_capture_dir);
+REXCVAR_DECLARE(std::string, log_network);
 REXCVAR_DEFINE_STRING(bo1_debug_dump_host, "", "BO1",
                       "Debug: send trace image dumps to this ip:port over TCP (tools/dump_receiver.py) instead of "
                       "writing them to bo1_debug_capture_dir; for the Switch");
@@ -79,11 +80,18 @@ REXCVAR_DEFINE_UINT32(bo1_debug_trace_frame, 0, "BO1",
                       "Debug: log every render pass, resolve and skipped draw of this frame number (0 = off)");
 REXCVAR_DEFINE_UINT32(bo1_debug_trace_after_s, 0, "BO1",
                       "Debug: like bo1_debug_trace_frame, for the first frame this many seconds after start (0 = off)");
+REXCVAR_DEFINE_UINT32(bo1_debug_dump_swaps, 0, "BO1",
+                      "Debug: with bo1_debug_trace_after_s, also dump the presented image of this many consecutive "
+                      "frames from the traced one (flicker hunting)");
 REXCVAR_DEFINE_UINT32(bo1_native_resolve_exp_bias, 2, "BO1",
                       "Native renderer: apply the exponent bias of color resolves (0 = ignore it; 1 = 2^bias; 2 = "
                       "2^(bias+5) for 16_16 and 16_16_16_16 sources, as the SDK's resolve does)");
 REXCVAR_DEFINE_BOOL(bo1_debug_mip_watch, false, "BO1",
                     "Debug: watch the mip data of large DXT textures (entropy at first sight and later changes)");
+REXCVAR_DEFINE_BOOL(bo1_native_skip_aliased_depth, true, "BO1",
+                    "Native renderer: skip depth-only draws into a depth target that lies inside a larger one with "
+                    "the same pitch and is never resolved itself. Each EDRAM base is its own image here, so those "
+                    "draws (the far half of BO1's 1024x2048 sun shadow map) never reached what the game resolves");
 REXCVAR_DEFINE_BOOL(bo1_native_memexport_copy, true, "BO1",
                     "Native renderer: do BO1's GPU memory copy (a memexport vertex shader) on the CPU; its texture "
                     "streamer copies the low mips into place with it");
@@ -337,6 +345,7 @@ struct RenderTarget {
   uint32_t height = 0;
   uint64_t last_used_frame = 0;
   uint64_t last_drawn_frame = 0;  // bo1-nx: last frame a pass rendered into it
+  bool ever_resolved = false;     // bo1-nx: a resolve has read it (see bo1_native_skip_aliased_depth)
 };
 
 // The attachments of a rendering scope: color 0-3 and depth.
@@ -505,6 +514,7 @@ struct Renderer::Impl {
   bool profile_frame = false;
   // bo1-nx debug (bo1_debug_trace_frame): this frame's passes, resolves and skips go to the log.
   bool trace_frame = false;
+  uint32_t dump_swaps_left = 0;
   uint32_t trace_pass_draws = 0;
   uint32_t trace_skip_logged = 0;
   uint64_t clear_redirects = 0;
@@ -632,7 +642,13 @@ struct Renderer::Impl {
   void DebugDumpImage(VkImage image, uint32_t width, uint32_t height, VkFormat format, const std::string& name,
                       uint32_t level = 0) {
     const std::string dir = REXCVAR_GET(bo1_debug_capture_dir);
-    const std::string host = REXCVAR_GET(bo1_debug_dump_host);
+    std::string host = REXCVAR_GET(bo1_debug_dump_host);
+    // Without a dump host, the machine receiving the network log (port 28772): the netloader cuts the arguments
+    // at about 256 characters, so a second address did not fit.
+    const std::string log_host = REXCVAR_GET(log_network);
+    if (host.empty() && dir.empty() && !log_host.empty()) {
+      host = log_host.substr(0, log_host.rfind(':')) + ":28772";
+    }
     if ((dir.empty() && host.empty()) || !image || !width || !height) return;
     uint32_t bpp = 0;
     switch (format) {
@@ -1731,6 +1747,23 @@ struct Renderer::Impl {
   std::vector<VulkanShader::VulkanTranslation*> translations_done;
   std::atomic<uint32_t> translations_done_count{0};
   bool translation_stop = false;
+  // SPIR-V from earlier sessions (a file next to the driver cache), by shader type, ucode hash and modification:
+  // a hit skips the translation. Only the thread calling EnsureTranslated uses the map; the file is appended to
+  // under spirv_cache_mutex by whichever thread translated.
+  struct CachedSpirv {
+    uint32_t type = 0;
+    uint64_t ucode_hash = 0;
+    uint64_t modification = 0;
+    uint32_t ucode_dwords = 0;
+    std::vector<SpirvShader::TextureBinding> textures;
+    std::vector<SpirvShader::SamplerBinding> samplers;
+    std::vector<uint8_t> binary;
+  };
+  std::unordered_map<uint64_t, CachedSpirv> spirv_cache;
+  std::mutex spirv_cache_mutex;
+  FILE* spirv_cache_file = nullptr;
+  bool TakeCachedTranslation(VulkanShader::VulkanTranslation* translation);
+  void StoreTranslation(VulkanShader::VulkanTranslation* translation);
   struct PipelineJob {
     uint64_t hash = 0;
     PipelineKey key = {};
@@ -1738,6 +1771,7 @@ struct Renderer::Impl {
     VkShaderModule pixel = VK_NULL_HANDLE;
     VkShaderModule geometry = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    bool prewarm = false;  // from the list of earlier sessions, compiled at boot
   };
   VkPipeline GetPipeline(const PipelineKey& key, VulkanShader::VulkanTranslation* vs,
                          VulkanShader::VulkanTranslation* ps, VkShaderModule geometry,
@@ -1753,6 +1787,18 @@ struct Renderer::Impl {
   std::vector<std::pair<uint64_t, VkPipeline>> pipelines_completed;
   std::atomic<uint32_t> pipelines_completed_count{0};
   bool pipeline_stop = false;
+  // Pipeline list (bo1-nx): the keys of every pipeline earlier sessions made, in a file next to the driver cache.
+  // At boot they are compiled on the worker, after any pipeline a draw is waiting for, with shader modules made from
+  // the SPIR-V cache; those modules are destroyed once the last of them is compiled.
+  std::deque<PipelineJob> prewarm_jobs;
+  std::vector<VkShaderModule> prewarm_modules;
+  uint32_t prewarm_remaining = 0;  // under pipeline_mutex
+  std::chrono::steady_clock::time_point prewarm_start;
+  std::unordered_set<uint64_t> listed_pipelines;  // in the file, or queued for it
+  std::unordered_map<uint64_t, PipelineKey> pending_list_keys;  // asked for, being compiled
+  std::vector<PipelineKey> pipelines_to_list;     // made this session, not yet written
+  FILE* pipeline_list_file = nullptr;              // written only by driver_cache_writer
+  void ListPipeline(uint64_t hash, const PipelineKey& key);
 
   // --- Render targets ------------------------------------------------------------
 
@@ -1761,6 +1807,7 @@ struct Renderer::Impl {
   RenderTargetKey CanonicalTargetKey(const RenderTargetKey& guest_key);
   RenderTarget* GetRenderTargetCanonical(const RenderTargetKey& key, uint32_t min_height);
   RenderTarget* FindClearAlias(const RenderTargetKey& guest_key, uint32_t& scale_x, uint32_t& scale_y);
+  bool DepthInsideAnother(const RenderTarget& rt) const;
   void EndPass() {
     if (in_pass) {
       dfn().vkCmdEndRendering(cmd());
@@ -2398,6 +2445,10 @@ void Renderer::Impl::Shutdown() {
     translation_cv.notify_all();
     translation_thread.join();
   }
+  if (spirv_cache_file) {
+    fclose(spirv_cache_file);
+    spirv_cache_file = nullptr;
+  }
   if (pipeline_thread.joinable()) {
     {
       std::lock_guard<std::mutex> lock(pipeline_mutex);
@@ -2405,6 +2456,14 @@ void Renderer::Impl::Shutdown() {
     }
     pipeline_cv.notify_all();
     pipeline_thread.join();
+  }
+  for (VkShaderModule module : prewarm_modules) {
+    dfn().vkDestroyShaderModule(vk, module, nullptr);
+  }
+  prewarm_modules.clear();
+  if (pipeline_list_file) {
+    fclose(pipeline_list_file);
+    pipeline_list_file = nullptr;
   }
   DrainCompletedPipelines();
   Submit();
@@ -2569,9 +2628,16 @@ bool Renderer::Impl::EnsureTranslated(VulkanShader::VulkanTranslation* translati
     if (!translation->shader().is_ucode_analyzed()) {
       translation->shader().AnalyzeUcode(disasm);
     }
-    if (!REXCVAR_GET(bo1_native_async_pipelines) || !translation_thread.joinable()) {
+    if (TakeCachedTranslation(translation)) {
+      ++stats().shaders_translated;
+      ++stats().shaders_from_cache;
+      translation_state[translation] = 2;
+    } else if (!REXCVAR_GET(bo1_native_async_pipelines) || !translation_thread.joinable()) {
       bool ok = translator->TranslateAnalyzedShader(*translation);
-      if (ok) translation->GetOrCreateShaderModule();
+      if (ok) {
+        translation->GetOrCreateShaderModule();
+        StoreTranslation(translation);
+      }
       ++stats().shaders_translated;
       translation_state[translation] = 2;
       if (!ok) {
@@ -2627,6 +2693,7 @@ void Renderer::Impl::TranslationThread() {
     }
     if (worker_translator->TranslateAnalyzedShader(*translation)) {
       translation->GetOrCreateShaderModule();
+      StoreTranslation(translation);
     } else {
       REXLOG_ERROR("[native] Shader {:016X} did not translate",
                    translation->shader().ucode_data_hash());
@@ -2664,6 +2731,7 @@ VkPipeline Renderer::Impl::GetPipeline(const PipelineKey& key,
     // Compiled on the worker. Until it is ready the draws that need it are
     // skipped, a frame or two of missing objects instead of a frozen frame.
     pending_pipelines.insert(hash);
+    if (!listed_pipelines.count(hash)) pending_list_keys.emplace(hash, key);
     {
       std::lock_guard<std::mutex> lock(pipeline_mutex);
       pipeline_jobs.push_back(job);
@@ -2676,6 +2744,7 @@ VkPipeline Renderer::Impl::GetPipeline(const PipelineKey& key,
   if (pipeline) {
     ++stats().pipelines_created;
     last_pipeline_time = std::chrono::steady_clock::now();
+    ListPipeline(hash, key);
   }
   pipelines.emplace(hash, pipeline);
   return pipeline;
@@ -2699,6 +2768,18 @@ void Renderer::Impl::DrainCompletedPipelines() {
       last_pipeline_time = std::chrono::steady_clock::now();
     }
   }
+  // The keys of what the draws asked for, to compile at the next boot. Prewarmed ones are already listed.
+  if (!pending_list_keys.empty()) {
+    for (auto it = pending_list_keys.begin(); it != pending_list_keys.end();) {
+      auto made = pipelines.find(it->first);
+      if (made == pipelines.end()) {
+        ++it;
+        continue;
+      }
+      if (made->second) ListPipeline(it->first, it->second);
+      it = pending_list_keys.erase(it);
+    }
+  }
 }
 
 void Renderer::Impl::PipelineThread() {
@@ -2711,17 +2792,31 @@ void Renderer::Impl::PipelineThread() {
     PipelineJob job;
     {
       std::unique_lock<std::mutex> lock(pipeline_mutex);
-      pipeline_cv.wait(lock, [&] { return pipeline_stop || !pipeline_jobs.empty(); });
+      pipeline_cv.wait(lock, [&] {
+        return pipeline_stop || !pipeline_jobs.empty() || !prewarm_jobs.empty();
+      });
       if (pipeline_stop) {
         return;
       }
-      job = pipeline_jobs.front();
-      pipeline_jobs.pop_front();
+      // What a draw is waiting for goes first.
+      std::deque<PipelineJob>& queue = pipeline_jobs.empty() ? prewarm_jobs : pipeline_jobs;
+      job = queue.front();
+      queue.pop_front();
     }
     VkPipeline pipeline = CreatePipeline(job);
     std::lock_guard<std::mutex> lock(pipeline_mutex);
     pipelines_completed.emplace_back(job.hash, pipeline);
     pipelines_completed_count.fetch_add(1, std::memory_order_release);
+    if (job.prewarm && --prewarm_remaining == 0) {
+      for (VkShaderModule module : prewarm_modules) {
+        dfn().vkDestroyShaderModule(vk, module, nullptr);
+      }
+      prewarm_modules.clear();
+      REXLOG_INFO("[native] Pipeline prewarm done in {} ms",
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - prewarm_start)
+                      .count());
+    }
   }
 }
 
@@ -2906,6 +3001,24 @@ RenderTargetKey Renderer::Impl::CanonicalTargetKey(const RenderTargetKey& guest_
     key.format = canonical[key.format];
   }
   return key;
+}
+
+// bo1-nx: whether a depth target's first EDRAM tile lies inside another depth target with the same pitch, MSAA and
+// format, which on the console would be the same memory.
+bool Renderer::Impl::DepthInsideAnother(const RenderTarget& rt) const {
+  const RenderTargetKey& k = rt.key;
+  const uint32_t pitch_tiles = (k.pitch * (k.msaa >= 2 ? 2 : 1) + 79) / 80;
+  const uint32_t rows_per_tile = k.msaa >= 1 ? 8 : 16;
+  if (!pitch_tiles) return false;
+  for (const auto& [key, other] : render_targets) {
+    if (other.get() == &rt || !key.is_depth || key.pitch != k.pitch || key.msaa != k.msaa ||
+        key.format != k.format || key.base_tiles >= k.base_tiles) {
+      continue;
+    }
+    const uint32_t end = key.base_tiles + pitch_tiles * ((other->height + rows_per_tile - 1) / rows_per_tile);
+    if (k.base_tiles < end) return true;
+  }
+  return false;
 }
 
 RenderTarget* Renderer::Impl::FindClearAlias(const RenderTargetKey& guest_key, uint32_t& scale_x,
@@ -3558,6 +3671,11 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
   // against the new ones.
   st.rt_generation = rt_generation;
   if (targets.Empty()) return fail(7);
+  if (targets.depth && !targets.color[0] && !targets.color[1] && !targets.color[2] && !targets.color[3] &&
+      !targets.depth->ever_resolved && REXCVAR_GET(bo1_native_skip_aliased_depth) &&
+      DepthInsideAnother(*targets.depth)) {
+    return fail(14);
+  }
 
   // Layout.
   st.vs = vs;
@@ -4664,6 +4782,10 @@ void Renderer::Impl::Resolve() {
     }
   }
   RenderTarget* source = GetRenderTarget(source_key, uint32_t(y1));
+  if (source && !source->ever_resolved) {
+    source->ever_resolved = true;
+    ++rt_generation;  // setups that skipped draws into it are rebuilt
+  }
   if (trace_frame) {
     TraceEndPass();
     auto trace_dest = r.Get<reg::RB_COPY_DEST_INFO>();
@@ -5127,6 +5249,15 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
         });
   }
   Submit();
+  if (trace_frame && REXCVAR_GET(bo1_debug_dump_swaps)) {
+    dump_swaps_left = REXCVAR_GET(bo1_debug_dump_swaps);
+  }
+  if (dump_swaps_left) {
+    --dump_swaps_left;
+    if (const ResolveDestination* d = textures.FindResolveDestination(address)) {
+      DebugDumpImage(d->image, d->width, d->height, d->format, fmt::format("swap_{:05d}", frame));
+    }
+  }
   if (trace_frame) {
     for (const auto& dump : trace_texture_dumps) {
       DebugDumpImage(dump.image, dump.width, dump.height, dump.format, dump.name);
@@ -5271,7 +5402,322 @@ std::vector<uint8_t> ReadDriverCache(const std::filesystem::path& path) {
   }
   return bytes;
 }
+// SPIR-V cache file: a header, then records appended as shaders are translated. A record that does not check out
+// ends the file: the next record written goes over it.
+constexpr uint64_t kSpirvCacheMagic = 0x3156505354414E52ULL;  // "RNATSPV1"
+// Bump when the translator or the modifications the renderer uses change, so old SPIR-V is not reused.
+constexpr uint32_t kSpirvCacheVersion = 1;
+constexpr uint32_t kSpirvRecordMagic = 0x43455253;  // "SREC"
+constexpr size_t kSpirvCacheMaxBytes = 96u * 1024 * 1024;
+
+struct SpirvCacheHeader {
+  uint64_t magic;
+  uint32_t version;
+  uint32_t vendor_id;
+  uint32_t device_id;
+  uint32_t driver_version;
+};
+
+struct SpirvRecordHeader {
+  uint32_t magic;
+  uint32_t type;
+  uint64_t ucode_hash;
+  uint64_t modification;
+  uint32_t ucode_dwords;
+  uint32_t texture_count;
+  uint32_t sampler_count;
+  uint32_t binary_size;
+  uint64_t checksum;  // of the record header up to here, the bindings and the binary
+};
+static_assert(sizeof(SpirvShader::TextureBinding) == 4 && sizeof(SpirvShader::SamplerBinding) == 4);
+
+uint64_t SpirvCacheKey(uint32_t type, uint64_t ucode_hash, uint64_t modification) {
+  const uint64_t key[] = {type, ucode_hash, modification};
+  return XXH3_64bits(key, sizeof(key));
+}
+
+uint64_t SpirvRecordChecksum(const SpirvRecordHeader& header, const void* payload, size_t size) {
+  return XXH3_64bits_withSeed(payload, size,
+                              XXH3_64bits(&header, offsetof(SpirvRecordHeader, checksum)));
+}
 }  // namespace
+
+bool Renderer::Impl::TakeCachedTranslation(VulkanShader::VulkanTranslation* translation) {
+  if (spirv_cache.empty()) {
+    return false;
+  }
+  Shader& shader = translation->shader();
+  auto it = spirv_cache.find(SpirvCacheKey(uint32_t(shader.type()), shader.ucode_data_hash(),
+                                           translation->modification()));
+  if (it == spirv_cache.end()) {
+    return false;
+  }
+  CachedSpirv entry = std::move(it->second);
+  spirv_cache.erase(it);
+  if (entry.type != uint32_t(shader.type()) || entry.ucode_hash != shader.ucode_data_hash() ||
+      entry.modification != translation->modification() ||
+      entry.ucode_dwords != shader.ucode_dword_count()) {
+    return false;
+  }
+  static_cast<SpirvShader&>(shader).SetBindingsFromCache(entry.textures.data(), entry.textures.size(),
+                                                         entry.samplers.data(), entry.samplers.size());
+  translation->SetTranslatedBinary(std::move(entry.binary));
+  return translation->GetOrCreateShaderModule() != VK_NULL_HANDLE;
+}
+
+void Renderer::Impl::StoreTranslation(VulkanShader::VulkanTranslation* translation) {
+  std::lock_guard<std::mutex> lock(spirv_cache_mutex);
+  if (!spirv_cache_file || !translation->is_valid()) {
+    return;
+  }
+  const auto& shader = static_cast<const SpirvShader&>(translation->shader());
+  const auto& textures = shader.GetTextureBindingsAfterTranslation();
+  const auto& samplers = shader.GetSamplerBindingsAfterTranslation();
+  const auto& binary = translation->translated_binary();
+  std::vector<uint8_t> payload((textures.size() + samplers.size()) * 4 + binary.size());
+  if (!textures.empty()) std::memcpy(payload.data(), textures.data(), textures.size() * 4);
+  if (!samplers.empty()) {
+    std::memcpy(payload.data() + textures.size() * 4, samplers.data(), samplers.size() * 4);
+  }
+  if (!binary.empty()) {
+    std::memcpy(payload.data() + (textures.size() + samplers.size()) * 4, binary.data(), binary.size());
+  }
+  SpirvRecordHeader header = {};
+  header.magic = kSpirvRecordMagic;
+  header.type = uint32_t(shader.type());
+  header.ucode_hash = shader.ucode_data_hash();
+  header.modification = translation->modification();
+  header.ucode_dwords = uint32_t(shader.ucode_dword_count());
+  header.texture_count = uint32_t(textures.size());
+  header.sampler_count = uint32_t(samplers.size());
+  header.binary_size = uint32_t(binary.size());
+  header.checksum = SpirvRecordChecksum(header, payload.data(), payload.size());
+  bool written = fwrite(&header, sizeof(header), 1, spirv_cache_file) == 1 &&
+                 fwrite(payload.data(), payload.size(), 1, spirv_cache_file) == 1 &&
+                 fflush(spirv_cache_file) == 0;
+  if (!written) {
+    // Stop writing; the partial record fails its checksum next time.
+    fclose(spirv_cache_file);
+    spirv_cache_file = nullptr;
+    REXLOG_WARN("[native] SPIR-V cache: write failed, not caching more shaders this session");
+  }
+}
+
+void Renderer::InitializeSpirvCache(const std::filesystem::path& directory, uint32_t title_id) {
+  Impl& im = *impl_;
+  const auto& properties = im.device->properties();
+  auto path = directory / fmt::format("native-{:08X}-{:08X}-{:08X}-{:08X}.spirv", title_id,
+                                      properties.vendorID, properties.deviceID,
+                                      properties.driverVersion);
+  const SpirvCacheHeader expected = {kSpirvCacheMagic, kSpirvCacheVersion, properties.vendorID,
+                                     properties.deviceID, properties.driverVersion};
+  // Records with a checksum that fails are where the valid data ends.
+  long valid_end = 0;
+  size_t loaded_bytes = 0;
+  if (FILE* file = rex::filesystem::OpenFile(path, "r+b")) {
+    SpirvCacheHeader header = {};
+    if (fread(&header, sizeof(header), 1, file) == 1 &&
+        std::memcmp(&header, &expected, sizeof(header)) == 0) {
+      valid_end = long(sizeof(header));
+      std::vector<uint8_t> payload;
+      SpirvRecordHeader record;
+      while (loaded_bytes < kSpirvCacheMaxBytes && fread(&record, sizeof(record), 1, file) == 1) {
+        if (record.magic != kSpirvRecordMagic || record.binary_size == 0 ||
+            record.binary_size > 4u * 1024 * 1024 || record.texture_count > 64 ||
+            record.sampler_count > 64) {
+          break;
+        }
+        size_t binding_bytes = size_t(record.texture_count + record.sampler_count) * 4;
+        payload.resize(binding_bytes + record.binary_size);
+        if (fread(payload.data(), payload.size(), 1, file) != 1 ||
+            SpirvRecordChecksum(record, payload.data(), payload.size()) != record.checksum) {
+          break;
+        }
+        Impl::CachedSpirv& entry =
+            im.spirv_cache[SpirvCacheKey(record.type, record.ucode_hash, record.modification)];
+        entry.type = record.type;
+        entry.ucode_hash = record.ucode_hash;
+        entry.modification = record.modification;
+        entry.ucode_dwords = record.ucode_dwords;
+        entry.textures.resize(record.texture_count);
+        entry.samplers.resize(record.sampler_count);
+        if (record.texture_count) {
+          std::memcpy(entry.textures.data(), payload.data(), size_t(record.texture_count) * 4);
+        }
+        if (record.sampler_count) {
+          std::memcpy(entry.samplers.data(), payload.data() + size_t(record.texture_count) * 4,
+                      size_t(record.sampler_count) * 4);
+        }
+        entry.binary.assign(payload.begin() + binding_bytes, payload.end());
+        loaded_bytes += payload.size();
+        valid_end = ftell(file);
+      }
+    }
+    if (valid_end > 0 && fseek(file, valid_end, SEEK_SET) == 0) {
+      im.spirv_cache_file = file;
+    } else {
+      fclose(file);
+    }
+  }
+  if (!im.spirv_cache_file) {
+    // Missing, from another driver or version, or unreadable: start over.
+    im.spirv_cache.clear();
+    loaded_bytes = 0;
+    if (FILE* file = rex::filesystem::OpenFile(path, "wb")) {
+      if (fwrite(&expected, sizeof(expected), 1, file) == 1 && fflush(file) == 0) {
+        im.spirv_cache_file = file;
+      } else {
+        fclose(file);
+      }
+    }
+  }
+  REXLOG_INFO("[native] SPIR-V cache: {} translations ({} KB) loaded from {}{}", im.spirv_cache.size(),
+              loaded_bytes >> 10, path.string(), im.spirv_cache_file ? "" : " (not writable)");
+}
+
+void Renderer::Impl::ListPipeline(uint64_t hash, const PipelineKey& key) {
+  if (listed_pipelines.insert(hash).second) {
+    pipelines_to_list.push_back(key);
+  }
+}
+
+namespace {
+constexpr uint64_t kPipelineListMagic = 0x314C505354414E52ULL;  // "RNATSPL1"
+// Bump when what a PipelineKey means changes.
+constexpr uint32_t kPipelineListVersion = 1;
+struct PipelineListHeader {
+  uint64_t magic;
+  uint32_t version;
+  uint32_t key_size;
+  uint32_t vendor_id;
+  uint32_t device_id;
+  uint32_t driver_version;
+  uint32_t reserved;
+};
+}  // namespace
+
+void Renderer::PrewarmPipelines(const std::filesystem::path& directory, uint32_t title_id) {
+  Impl& im = *impl_;
+  const auto& properties = im.device->properties();
+  auto path = directory / fmt::format("native-{:08X}-{:08X}-{:08X}-{:08X}.pipelines", title_id,
+                                      properties.vendorID, properties.deviceID,
+                                      properties.driverVersion);
+  const PipelineListHeader expected = {kPipelineListMagic, kPipelineListVersion,
+                                       uint32_t(sizeof(PipelineKey)), properties.vendorID,
+                                       properties.deviceID, properties.driverVersion, 0};
+  std::vector<PipelineKey> keys;
+  long valid_end = 0;
+  if (FILE* file = rex::filesystem::OpenFile(path, "r+b")) {
+    PipelineListHeader header = {};
+    if (fread(&header, sizeof(header), 1, file) == 1 &&
+        std::memcmp(&header, &expected, sizeof(header)) == 0) {
+      valid_end = long(sizeof(header));
+      PipelineKey key;
+      uint64_t checksum;
+      while (keys.size() < 8192 && fread(&key, sizeof(key), 1, file) == 1 &&
+             fread(&checksum, sizeof(checksum), 1, file) == 1 &&
+             XXH3_64bits(&key, sizeof(key)) == checksum) {
+        keys.push_back(key);
+        valid_end = ftell(file);
+      }
+    }
+    if (valid_end > 0 && fseek(file, valid_end, SEEK_SET) == 0) {
+      im.pipeline_list_file = file;
+    } else {
+      fclose(file);
+    }
+  }
+  if (!im.pipeline_list_file) {
+    keys.clear();
+    if (FILE* file = rex::filesystem::OpenFile(path, "wb")) {
+      if (fwrite(&expected, sizeof(expected), 1, file) == 1 && fflush(file) == 0) {
+        im.pipeline_list_file = file;
+      } else {
+        fclose(file);
+      }
+    }
+  }
+  if (!im.pipeline_thread.joinable() || !im.driver_cache) {
+    for (const PipelineKey& key : keys) {
+      im.listed_pipelines.insert(XXH3_64bits(&key, sizeof(key)));
+    }
+    return;
+  }
+  // One module per cached translation used, shared by the pipelines that use it.
+  std::unordered_map<uint64_t, VkShaderModule> modules;
+  auto module_for = [&](xenos::ShaderType type, uint64_t hash, uint64_t modification) -> VkShaderModule {
+    uint64_t cache_key = SpirvCacheKey(uint32_t(type), hash, modification);
+    auto made = modules.find(cache_key);
+    if (made != modules.end()) return made->second;
+    VkShaderModule module = VK_NULL_HANDLE;
+    auto entry = im.spirv_cache.find(cache_key);
+    if (entry != im.spirv_cache.end() && entry->second.ucode_hash == hash &&
+        entry->second.modification == modification && entry->second.type == uint32_t(type)) {
+      VkShaderModuleCreateInfo info = {};
+      info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+      info.codeSize = entry->second.binary.size();
+      info.pCode = reinterpret_cast<const uint32_t*>(entry->second.binary.data());
+      if (im.dfn().vkCreateShaderModule(im.vk, &info, nullptr, &module) != VK_SUCCESS) {
+        module = VK_NULL_HANDLE;
+      } else {
+        im.prewarm_modules.push_back(module);
+      }
+    }
+    modules.emplace(cache_key, module);
+    return module;
+  };
+  std::deque<Impl::PipelineJob> jobs;
+  uint32_t missing = 0;
+  for (const PipelineKey& key : keys) {
+    uint64_t hash = XXH3_64bits(&key, sizeof(key));
+    im.listed_pipelines.insert(hash);
+    if (im.pipelines.count(hash) || im.pending_pipelines.count(hash)) continue;
+    Impl::PipelineJob job;
+    job.hash = hash;
+    job.key = key;
+    job.prewarm = true;
+    job.vertex = module_for(xenos::ShaderType::kVertex, key.vs_hash, key.vs_modification);
+    if (key.ps_hash) {
+      job.pixel = module_for(xenos::ShaderType::kPixel, key.ps_hash, key.ps_modification);
+    }
+    const PipelineLayout* layout =
+        im.GetPipelineLayout(uint32_t(key.layout >> 48), uint32_t(key.layout >> 32) & 0xFFFF,
+                             uint32_t(key.layout >> 16) & 0xFFFF, uint32_t(key.layout) & 0xFFFF);
+    job.layout = layout ? layout->layout : VK_NULL_HANDLE;
+    if (key.geometry_shader) {
+      auto it = im.geometry_shaders.find(key.geometry_shader);
+      if (it == im.geometry_shaders.end()) {
+        GeometryShaderKey gs_key;
+        gs_key.key = key.geometry_shader;
+        it = im.geometry_shaders.emplace(key.geometry_shader, CreateGeometryShader(im.device, gs_key)).first;
+      }
+      job.geometry = it->second;
+    }
+    if (!job.vertex || (key.ps_hash && !job.pixel) || !job.layout ||
+        (key.geometry_shader && !job.geometry)) {
+      ++missing;
+      continue;
+    }
+    im.pending_pipelines.insert(hash);
+    jobs.push_back(job);
+  }
+  REXLOG_INFO("[native] Pipeline list: {} known, {} to compile at boot, {} without their shaders cached; {}",
+              keys.size(), jobs.size(), missing, path.string());
+  if (jobs.empty()) {
+    for (VkShaderModule module : im.prewarm_modules) {
+      im.dfn().vkDestroyShaderModule(im.vk, module, nullptr);
+    }
+    im.prewarm_modules.clear();
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(im.pipeline_mutex);
+    im.prewarm_start = std::chrono::steady_clock::now();
+    im.prewarm_remaining = uint32_t(jobs.size());
+    for (auto& job : jobs) im.prewarm_jobs.push_back(job);
+  }
+  im.pipeline_cv.notify_one();
+}
 
 void Renderer::InitializeDriverCache(const std::filesystem::path& cache_root,
                                      uint32_t title_id) {
@@ -5285,6 +5731,7 @@ void Renderer::InitializeDriverCache(const std::filesystem::path& cache_root,
   if (error) {
     return;
   }
+  InitializeSpirvCache(directory, title_id);
   const auto& properties = im.device->properties();
   im.driver_cache_path =
       directory / fmt::format("native-{:08X}-{:08X}-{:08X}-{:08X}.cache", title_id,
@@ -5319,28 +5766,51 @@ void Renderer::InitializeDriverCache(const std::filesystem::path& cache_root,
   im.driver_cache_saved_size = data.size();
   REXLOG_INFO("[native] Driver pipeline cache: {} KB loaded from {}", data.size() >> 10,
               im.driver_cache_path.string());
+  PrewarmPipelines(directory, title_id);
 }
 
 void Renderer::Impl::SaveDriverCache() {
   pipelines_at_last_save = stats().pipelines_created;
+  auto keys = std::make_shared<std::vector<PipelineKey>>(std::move(pipelines_to_list));
+  pipelines_to_list.clear();
   size_t size = 0;
-  if (dfn().vkGetPipelineCacheData(vk, driver_cache, &size, nullptr) != VK_SUCCESS ||
-      size < 32 || size == driver_cache_saved_size) {
+  std::shared_ptr<std::vector<uint8_t>> data;
+  if (dfn().vkGetPipelineCacheData(vk, driver_cache, &size, nullptr) == VK_SUCCESS && size >= 32 &&
+      size != driver_cache_saved_size) {
+    data = std::make_shared<std::vector<uint8_t>>(size);
+    if (dfn().vkGetPipelineCacheData(vk, driver_cache, &size, data->data()) == VK_SUCCESS) {
+      data->resize(size);
+      driver_cache_saved_size = size;
+    } else {
+      data.reset();
+    }
+  }
+  if (!data && keys->empty()) {
     return;
   }
-  auto data = std::make_shared<std::vector<uint8_t>>(size);
-  if (dfn().vkGetPipelineCacheData(vk, driver_cache, &size, data->data()) != VK_SUCCESS) {
-    return;
-  }
-  data->resize(size);
-  driver_cache_saved_size = size;
   driver_cache_writing = true;
   std::filesystem::path path = driver_cache_path;
   // Joined, never detached: detaching throws on Horizon, which ended the game.
   if (driver_cache_writer.joinable()) {
     driver_cache_writer.join();
   }
-  driver_cache_writer = std::thread([this, data, path]() {
+  driver_cache_writer = std::thread([this, data, keys, path]() {
+    if (pipeline_list_file && !keys->empty()) {
+      bool written = true;
+      for (const PipelineKey& key : *keys) {
+        const uint64_t checksum = XXH3_64bits(&key, sizeof(key));
+        written = written && fwrite(&key, sizeof(key), 1, pipeline_list_file) == 1 &&
+                  fwrite(&checksum, sizeof(checksum), 1, pipeline_list_file) == 1;
+      }
+      if (!written || fflush(pipeline_list_file) != 0) {
+        fclose(pipeline_list_file);
+        pipeline_list_file = nullptr;
+      }
+    }
+    if (!data) {
+      driver_cache_writing = false;
+      return;
+    }
     auto temporary = path;
     temporary += ".tmp";
     if (FILE* file = rex::filesystem::OpenFile(temporary, "wb")) {

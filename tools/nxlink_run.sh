@@ -41,6 +41,14 @@ NC_PID=$!
 trap 'kill $NC_PID 2>/dev/null || true' EXIT
 sleep 0.5
 
+ARGS="--log_network=$HOST_IP:$PORT --game_data_root=sdmc:/switch/bo1-nx/game_root${EXTRA_ARGS:+ $EXTRA_ARGS}"
+# The netloader passes only about 256 characters of arguments: anything after that is silently dropped.
+if (( ${#ARGS} > 250 )); then
+  echo "error: the arguments are ${#ARGS} characters; the netloader keeps only ~256 and drops the rest:" >&2
+  echo "       ...${ARGS:240}" >&2
+  exit 1
+fi
+
 echo "== sending $(basename "$NRO") ($(du -h "$NRO" | cut -f1)) to ${SWITCH_IP:-the Switch (broadcast search)}"
 addr=()
 [[ -n "$SWITCH_IP" ]] && addr=(-a "$SWITCH_IP")
@@ -48,7 +56,7 @@ addr=()
 sent=0
 for attempt in $(seq 1 200); do
   if "$NXLINK" "${addr[@]+"${addr[@]}"}" -r 5 -p switch/bo1-nx/bo1-nx.nro \
-       --args "--log_network=$HOST_IP:$PORT --game_data_root=sdmc:/switch/bo1-nx/game_root${EXTRA_ARGS:+ $EXTRA_ARGS}" "$NRO"; then
+       --args "$ARGS" "$NRO"; then
     sent=1
     break
   fi

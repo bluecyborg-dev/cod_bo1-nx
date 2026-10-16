@@ -38,6 +38,14 @@ class ChangeDetector {
   static constexpr uint32_t kTrustedChecks = 12;
   static constexpr uint64_t kFullEvery = 16;
   static constexpr uint64_t kTrustedEvery = 8;
+  // bo1-nx: data that changed at least this many times is rewritten in place by the game (BO1's model lighting
+  // and other per-frame CPU data): it stays on full hashes every frame, since a partial rewrite slips past the
+  // samples and showed as characters flickering. Only for ranges up to dynamic_max_bytes, so textures loaded into
+  // reused memory once or twice are not affected. 0 turns this off.
+  static inline uint32_t dynamic_changes = 4;
+  static inline size_t dynamic_max_bytes = 4u * 1024 * 1024;
+  // Diagnostics: hash everything in full every frame.
+  static inline bool always_full = false;
 
   // Returns the content hash of [data, data + size), hashing it all only when
   // needed. `stagger` spreads the full hashes over frames.
@@ -51,6 +59,7 @@ class ChangeDetector {
 
   uint64_t Check(const uint8_t* data, size_t size, uint64_t frame, uint64_t stagger,
                  uint64_t& bytes_hashed) {
+    size_ = size;
     const uint32_t trusted_checks = TrustedChecks();
     if (unchanged_ >= trusted_checks && (frame + stagger) % kTrustedEvery) {
       return hash_;
@@ -99,8 +108,18 @@ class ChangeDetector {
   // made every texture a level loads into reused memory hash in full every
   // frame (7% of the ring thread), and the cutscene it was meant for turned
   // out to be decoded correctly into textures that do reach the renderer.
-  uint32_t StableChecks() const { return kStableChecks; }
-  uint32_t TrustedChecks() const { return kTrustedChecks; }
+  bool Dynamic() const {
+    return always_full ||
+           (dynamic_changes && changes_ >= dynamic_changes && size_ <= dynamic_max_bytes);
+  }
+  uint32_t StableChecks() const { return Dynamic() ? UINT32_MAX : kStableChecks; }
+  uint32_t TrustedChecks() const { return Dynamic() ? UINT32_MAX : kTrustedChecks; }
+
+ public:
+  uint32_t changes() const { return changes_; }
+
+ private:
+  size_t size_ = 0;
 
   uint64_t hash_ = 0;
   uint64_t sample_ = 0;

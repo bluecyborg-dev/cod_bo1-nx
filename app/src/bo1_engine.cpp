@@ -368,9 +368,13 @@ REXCVAR_DEFINE_DOUBLE(bo1_stream_restore_after_s, 1.5, "bo1",
 REXCVAR_DEFINE_INT32(bo1_dvars_delay_s, 10, "bo1",
                      "Seconds after the first cinematic job before bo1_dvars is first applied");
 REXCVAR_DEFINE_STRING(bo1_dvars,
-                      "sm_enable 0; r_dof_enable 0; r_distortion 0; r_flameFX_enable 0; cg_brass 0; "
-                      "fx_marks_smodels 0; ragdoll_enable 0",
+                      "r_dof_enable 0; r_distortion 0; r_flameFX_enable 0; cg_brass 0; fx_marks_smodels 0; "
+                      "ragdoll_enable 0",
                       "bo1", "Engine settings to apply (\"dvar value; dvar value\"; empty = the game's own)");
+REXCVAR_DEFINE_STRING(bo1_shadows, "off", "bo1",
+                      "Dynamic shadows, applied after bo1_dvars: off (sm_enable 0: fastest, but models flicker between "
+                      "lit and dark near lights), lite (one spot light, world casters only, short sun shadow range, low "
+                      "quality), full (the game's own), or empty to leave them to bo1_dvars");
 
 REX_EXTERN(__imp__sub_8232EA30);
 namespace {
@@ -457,6 +461,20 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
   static std::string periodic;
   static const std::string commands = [] {
     std::string list = REXCVAR_GET(bo1_dvars);
+    const std::string shadows = REXCVAR_GET(bo1_shadows);
+    if (shadows == "off") {
+      list += "; sm_enable 0";
+    } else if (shadows == "lite" || shadows == "min") {
+      // The shadow system stays on (with it off, models near lights alternate between lit and dark every frame);
+      // what it draws is cut down: one spot light, no static model or entity casters, a small low quality map, and
+      // the sun's shadow over a quarter of the distance (its two passes were ~2,850 draws a frame, now ~700).
+      // sm_sunEnable, sm_spotEnable and r_spotLightShadows are not used: setting them changed nothing.
+      list += "; sm_enable 1; sm_maxLights 1; r_spotLightSModelShadows 0; r_spotLightEntityShadows 0; "
+              "sm_qualitySpotShadow 0; sm_fullResSpotShadowEnable 0; sm_strictCull 1; sm_sunShadowScale 0.25; "
+              "sm_sunSampleSizeNear 0.25; sm_fastSunShadow 1; sm_sunShadowSmallEnable 1";
+    } else if (shadows == "full") {
+      list += "; sm_enable 1";
+    }
     std::replace(list.begin(), list.end(), '+', ' ');
     std::string out;
     size_t start = 0;

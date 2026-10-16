@@ -1,0 +1,112 @@
+# What other Switch ports did, and what BO1 should take from them (2026-10-15)
+
+Read for this: the Xbox 360 static recompilations that share our toolchain (ReXGlue + NVK), plus the other demanding
+ports the user listed and the [SwitchPorts](https://github.com/robzilla10001/SwitchPorts) index. Only documents
+and code were read; nothing was copied or run. Each item says where it was measured and what it would mean for BO1.
+
+## The ports, and how close they are to us
+
+| Port | Approach | Relevance to BO1 |
+|---|---|---|
+| [sa2-nx](https://github.com/ChanseyIsTheBest/sa2-nx) (Sonic Adventure 2) | ReXGlue + native Vulkan renderer (masseffect-nx lineage), 60 FPS at stock clocks | **Highest.** `docs/porting-guide.md` is a complete method; `docs/enhancements.md` and `docs/gpu-optimisation-candidates.md` measure every change |
+| [futari-nx](https://github.com/ChanseyIsTheBest/futari-nx) (Mushihimesama Futari) | same lineage | **High.** `xbox360.md` is a notebook shared by five ports (Futari, SA2, Banjo, Peggle 2, Sonic Transformed): general optimisations and the ones that broke things |
+| [UnleashedRecomp-NX](https://github.com/ChanseyIsTheBest/UnleashedRecomp-NX) (Sonic Unleashed, the heaviest 360 game on the list) | XenonRecomp + D3D-level renderer (not PM4) | **High for GPU ideas.** `docs/SWITCH-PERFORMANCE.md`: 10 measured rounds, every change image-identical and behind a key |
+| [the-simpsons-game-nx](https://github.com/R-drg/the-simpsons-game-nx), [defjam-sw](https://github.com/R-drg/defjam-sw) | R-drg, the author of project8-sw (where our renderer comes from) | **High for the driver:** Mesa patches on **our exact Mesa commit `d4a00ea0ab3`** |
+| [RaymanOriginsRecomp](https://github.com/XDanfr/RaymanOriginsRecomp) | ReXGlue, D3D-level native renderer, macOS/Android only | Low: no Switch build; the idea of drawing from the D3D device instead of PM4 |
+| Twilight Princess ([dusklight](https://github.com/HayatoG/dusklight), [dusklight-nx](https://github.com/souldbminerr/dusklight-nx)), Melee-NX | decomp + Aurora/Dawn WebGPU on NVK | Low: a WebGPU layer; dusklight-nx says NVK "doesn't perform well" and is moving to deko3d for "2x+" |
+| [jak-project-switch](https://github.com/fildicio/jak-project-switch) (OpenGOAL) | source port on OpenGL | Medium as a lesson: CPU-side GL submission was the whole bottleneck (45-67 ms); planning deko3d |
+| gta3-nx, 0ad-switch, smashhit_nx, sonic_allstars_nx, DBT-NX | source/Android ports | Low: little performance writing; gta3 has a `full_preload` option (all textures before play, less stutter) |
+
+## The method that made SA2 run at 60 FPS (worth adopting as-is)
+
+1. **One key per optimisation, two master keys** (CPU / non-CPU), a startup line listing what is on, and a use
+   counter every 10 s. A missing config key means ON, so an old toml on the SD card cannot silently turn things off.
+2. **Every fast path checks itself** against the old path for its first uses (all uses in a verify mode); the
+   difference count must stay 0.
+3. **Pixel tests in lockstep:** a mode with one vblank per presented frame, so two runs give the same frames; compare
+   per-frame hashes against the build before. Gameplay frames are only partly reproducible; judge on menus/fades.
+4. **The console decides.** PC/Mac timings mislead on a 1020 MHz A57 with 2 MB L2; compare thread CPU time, not FPS,
+   when the frame rate is capped.
+5. **Stack-sampling profiler on the console** (every 1 ms, pc + lr + frame chain, symbolized with the build's ELF;
+   archive every tested ELF). Use pc-based self time for leaf functions.
+
+## Recommendations for BO1, ranked
+
+Our numbers today (docked, 20 FPS cap): renderer 15-25 ms, GPU 15-20 ms, game thread not measured. **Step 0 is a
+console CPU profile**: without it we do not know whether the game thread, the ring thread or the GPU limits 30 FPS.
+
+### A. CPU: the translated game code (all game threads at once)
+
+What our build already has: `skip_msr`, `ctr/xer/reserved/cr_as_local`, `-ffp-contract=off -fno-strict-aliasing`,
+`-fno-math-errno -fno-trapping-math`. What it lacks, with the gains others measured:
+
+| # | Change | Measured elsewhere | Notes for BO1 |
+|---|---|---|---|
+| A1 | **Guest memory without `volatile`** + `REX_LOOP_BARRIER()` at every loop header | masseffect-nx +15-20 % | Mandatory barriers: without them GCC turned 172 polling loops into `b .` (Futari boot hang). Check every ELF for branch-to-self loops |
+| A2 | **Direct calls** between translated functions (post-codegen pass) | lets GCC inline; ~178k calls in Futari | Hooked functions must stay indirect; re-run when a hook is added |
+| A3 | **No FPCR switches around pure float moves** (`fp_moves_modeless`) | SA2: 20-26 % of the game thread's samples sat right after an `msr fpcr` | FPCR writes are expensive on the A57 |
+| A4 | **`elide_lr_stores`** (no `ctx.lr = ...` before every call) | part of the "diet": masseffect-nx −10 % main thread | Our overrides say LR is needed for setjmp/SEH; SA2/Peggle 2 solved it with `lr_keep_callees` and `tools/read_before_write.py` |
+| A5 | **`non_volatile_as_local` / `non_argument_as_local`** | masseffect-nx +9 %; Peggle 2 `ctx.r11` uses 549,939 → 13,488 | Needs `share_registers` for the setjmp callers and split SEH fragments (`scan_caller_register_reads.py --with-callers`) |
+| A6 | **LTO + `-fipa-pta`**, then **PGO** from one console session | SA2: PGO ≈ +15 % (single player stopped dipping below 60) | PGO needs `-fprofile-info-section` + streaming the counts (games are closed with HOME). With LTO build xxHash with `XXH_FORCE_MEMORY_ACCESS=0` |
+| A7 | **Hot functions first** in `.text` (linker order from console samples) | SA2/Unleashed | 55 MB of code vs a 48 KB I-cache; keep `.crt0` first |
+| A8 | **Native memcpy/memset** (NEON) for the XDK/CRT versions | Futari: 40 M verified calls | Guarded by a code hash of the guest bytes |
+| A9 | **Localized copies / hand natives** of the hottest game functions, each verified against the original while running | SA2: njCalcPoint inline took the largest single cost (8.5 %) away | Only after a profile names them |
+
+### B. CPU: waiting less
+
+| # | Change | Measured | For BO1 |
+|---|---|---|---|
+| B1 | **D3D's GPU-wait spin → sleep until the ring advances** | Futari: game thread 96 % → 8 % busy (PC), console 96 % → 59 % | Find BO1's XDK wait (8× `db16cyc` then a read-pointer check); the spin steals a core from the other game threads |
+| B2 | **The game's own frame-pacing spin loops → sleep** (`while (counter == last) {}` bumped by the vblank callback) | Futari: 78.6 % of the game thread's busy time | Look for the same shape in BO1 |
+| B3 | **Relaxed vsync**: give the game its vblank when the flip waits, never sooner than 1/60 s after the last | SA2 PC test: 30 → 54.6 FPS with 18 ms of ring work | Relevant if we go for 30 FPS: a 34 ms frame drops to 20 FPS with a fixed vblank |
+| B4 | Log file written by its own thread once a second | Futari: 1 s stutters were the log (SD writes under the sink mutex) | We already have `log_nonblocking`; keep periodic reports off the hot threads |
+| B5 | `thread_local` is a function call on the Switch | SA2 | Keep it out of per-draw loops |
+
+### C. Renderer (ring thread)
+
+| # | Change | Measured | For BO1 |
+|---|---|---|---|
+| C1 | **Fingerprints with the A57's CRC32 instructions** instead of XXH3 | SA2 `fingerprint_mode = 2` | Our texture/vertex hashing is XXH3 |
+| C2 | **No per-draw `fmt::format` / string keys** in diagnostics | ~8 % of the ring in masseffect-lineage renderers | Audit our draw path |
+| C3 | **Memo of the render-target setup** when nothing changed (EDRAM memo) | ~6-9 % of the ring | We have `setup_cache`; check its hit rate |
+| C4 | **Constant uploads only when they changed** / only the registers the shader reads | Unleashed; SA2 (77 % of draws re-uploaded VS constants) | |
+| C5 | **Never read back from the upload buffer** (it is uncached NvMap memory) | Futari: 91 % of its ring | Check our vertex conversions |
+| C6 | Deferred Vulkan recording on a worker | masseffect-nx: ring 62 → 40 % of a core | **Not pixel-identical** in Futari/SA2 and stalls with read-backs; ours is off (`bo1_native_record_thread`) — keep it off unless lockstep tests pass |
+| C7 | Dynamic blend state (EDS) to cut pipeline binds | Futari: 160 binds a frame → 7 | **Not pixel-identical** (212 of 1,098 frames differed); rejected |
+
+### D. GPU and driver (NVK on Maxwell)
+
+Cost model from sa2-nx `gpu-optimisation-candidates.md` §2: **every barrier is a full GPU idle (WFI)**; every legacy
+render pass pays one WFI at begin and one plus cache invalidates at end; `vkCmdCopyImage` of colour is a meta draw that
+dirties all state; each `vkQueueSubmit` is an IPC (two submits a frame left the GPU idle 3.6 ms in NFSMW).
+
+| # | Change | Measured | For BO1 |
+|---|---|---|---|
+| D1 | **Mesa: direct draws when the draw parameters are zero + cached memory query** (Simpsons patch 0003, our Mesa commit) | removes a draw macro per draw and a `mallinfo` heap walk under a lock every few dozen allocations | Not in our patch; apply |
+| D2 | Mesa: UBO descriptors read at bind time (Simpsons 0001) | project8 Free Skate 2-3 → 7-8 FPS, no device loss | We use `UNIFORM_BUFFER_DYNAMIC`, probably not affected; verify |
+| D3 | **ZCULL**: depth images without `TRANSFER_DST` usage get a ZCULL plane | NFSMW ~2 ms | All our targets have `TRANSFER_SRC|DST`; depth targets need another path for their copies |
+| D4 | **Fewer passes and barriers**: clears inside the pass (`vkCmdClearAttachments`, no WFI), batch barriers, narrow end dependencies | Unleashed 60 → 37 barrier batches per frame | We run ~16 passes a frame |
+| D5 | **Resolves only when read**: drop resolves overwritten before any read, hand a cleared target's image over instead of copying | Unleashed: 24 of 26 copies became hand-overs; resolve copies were 5.8 ms of the frame | |
+| D6 | **Depth-only draws without a fragment stage** when the pixel shader has no effect | Unleashed | Our depth prepass (~660 draws) and the shadow passes |
+| D7 | **Skip draws that write no colour and no depth** | Unleashed | We already skip them (reason 7) |
+| D8 | Vertex outputs the pixel shader never reads not computed; colour channels nothing writes not computed | Unleashed; NVK links varyings already for monolithic pipelines | |
+| D9 | One `vkQueueSubmit` per frame | NFSMW | We make ~1.5 a frame |
+| D10 | **Render scale** (e.g. 960x544 handheld) | SA2 ships 720p handheld / 1080p docked switching live | Our planned item; GPU-bound scenes |
+| D11 | Two or more prewarm threads | Banjo: 23 % of the ring in newlib's malloc lock | Keep one pipeline worker |
+
+### E. Flicker: what the others learned
+
+- **Turning a game system off can leave shaders reading stale data** (our `sm_enable 0` case): shrink it instead.
+- **Texture fetch exponent bias** must be applied (FXAA 360 averages two biased fetches; ignored, edges flicker).
+  We apply the resolve exponent bias; check the *fetch constant's* bias too.
+- A self-check that reads guest memory twice reports false differences on dynamic buffers; snapshot once.
+- Deferred recording and dynamic blend state changed pixels in lockstep tests although their own checks passed:
+  pixel tests, not only self-checks.
+
+## Proposed order for BO1
+
+1. Console CPU profile in Kino (stack sampler): which thread limits, and its top functions.
+2. B1/B2 (the waits), if the profile shows the spin.
+3. A1-A3 + A2 as one codegen round (with the loop-barrier and branch-to-self checks), then A6 (LTO, then PGO).
+4. D1 (Mesa patch), D3 (ZCULL), D5/D6 (resolves, depth-only), D10 (960x544) for the GPU side.
+5. C1-C5 on the ring, guided by the profile.
