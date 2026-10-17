@@ -325,3 +325,39 @@ After those experiments, pursue multi-draw/instancing only where the capture sho
 - **High confidence:** the arithmetic for the current frame budget and pixel-count reductions; priority-number direction in Switchbrew; the cited Mesa release-note entries; deko3d’s documented command-list/capture concepts; published Switch-port resolution observations.
 - **Medium confidence:** that state caching, upstream draw-list suppression, effect-resolution reduction, and adaptive resolution are the most promising engineering targets, given the measurements in the project description.
 - **Low confidence / not publicly measured:** exact milliseconds saved by multi-draw, NVK per-draw locking/UBO/descriptor updates on Horizon, best thread priority/core mask, 2 MB-page benefit, translated PPC optimization gains, and NVK-versus-deko3d performance for an equivalent Black Ops workload. These require testing on the actual port; this report intentionally does not invent benchmarks.
+
+---
+
+## Review notes (bo1-nx, 2026-10-16/17)
+
+Checked against the port's own measurements and console tests. The report marks estimates as estimates and invents no
+benchmarks; most of it is general method. Item by item:
+
+- **Instrument the per-draw path by stage (first action 1):** agreed, the most useful item. The console profiler now
+  records pc/lr caller pairs; a per-stage stopwatch on the renderer thread is the next step.
+- **Dirty-state tracking / skip redundant binds and constant writes (action 2):** largely in place already (setup cache,
+  viewport/scissor/blend/bias change checks; NVK's "CB0 only when changed" is in our Mesa pin, d4a00ea0ab3 = Mesa
+  26.2.3). Still worth adding requested-versus-emitted counters to prove it.
+- **Suppress the shadow system's extra draw lists upstream (action 3):** right diagnosis. With `sm_enable 1` the game
+  issues ~2.8x the draws (Mac, Kino: ~905k vs ~326k per 10 s), and ~580k of them are shadow-map caster draws that the
+  `min` preset skips, so the draws actually rendered are about the same. It only matters for `min`; the user plays with
+  shadows off.
+- **Dynamic resolution from 960x544 (action 4):** the premise is wrong. The port renders 1040x608 (960x544 was only a
+  plan item), and in a PM4 translator the game's EDRAM-sized targets make dynamic resolution a large job.
+- **Frames in flight and priority/affinity (action 5):** frames in flight is still on the checklist, untested. Horizon
+  priorities are handled by the SDK (renderer ring thread at 0x2C); the real CPU wins so far came from removing busy
+  waits, found with the stack sampler (job workers 50-67 % → 14-20 % of a core each).
+- **ZCULL / prepass skipping:** both tried on the console after this report. Skipping the depth prepass cut renderer
+  draws from 987 to 559 per frame but raised GPU time from 36 to 42 ms per frame (hidden pixels no longer rejected
+  early), so it is off. ZCULL-capable depth targets worked (NVK gave every depth target a plane) but showed no
+  measurable gain, and held ZL behaved like rapid tapping while it was on, so it is off too.
+- **Heavy effects in busy scenes (section 3.2):** confirmed as the source of the remaining stutters. Frames of 70-199 ms
+  average ~1,370 draws against ~860 for an average frame, with no shader, pipeline or texture creation in them. The
+  effect-culling dvars are being tested (`bo1_fx_lite`).
+- **VK_EXT_multi_draw, instancing, reused command buffers:** low value until a capture shows long runs of
+  state-identical consecutive draws, which BO1's stream has shown few of.
+- **deko3d:** agreed: benchmark before any rewrite.
+- **Corrections:** "Mesa 26.1 disables large pages" concerns NVK's GPU pages, not CPU-side guest memory mapping. Two
+  links (the techoverflow multi-draw article and the personal `nimauria/Xenon-Recomp` repository) could not be
+  confirmed as primary sources; the main Xbox 360 recompiler families are ReXGlue (used here) and hedge-dev's
+  XenonRecomp.

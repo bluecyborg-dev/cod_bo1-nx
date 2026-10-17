@@ -97,3 +97,26 @@ In practice, you can assume the same dvars exist on 360 and PC. Many defaults ma
 
 **Sources:** We relied on official mod-tool docs and community wikis for descriptions, and on engine command dumps for defaults. Inferred effects are noted as such (e.g. how enabling culling “removes” elements). No generic “just lower settings” advice is included – every claim is tied to a specific dvar or documented behavior. 
 
+
+---
+
+## Review notes (bo1-nx, 2026-10-16/17)
+
+- **Defaults:** the ones we could check against the game's own dvar registration (`sub_8258CDA8`) match: `sm_maxLights`
+  4, `r_spotLightEntityShadows` 1, `r_spotLightSModelShadows` 1, `sm_sunShadowSmallEnable` 0, `sm_strictCull` 1,
+  `sm_fastSunShadow` 1.
+- **"Why ~2x draws with sm_enable 1" (section 1):** the answer here (extra lighting passes per light) is inferred and
+  does not match a measurement. Mac, Kino, prepass not skipped: with the `min` preset the game issues ~905k draws per
+  10 s against ~326k with shadows off, and ~580k of them are shadow-map caster draws that the renderer skips, so the
+  draws actually rendered are about the same (~310k vs ~326k). The extra cost is the game building, and the renderer
+  parsing, caster draws that are thrown away.
+- **Shadow levers:** fewer shadowed lights, no entity/static-model spot casters and the small sun map are exactly what
+  the port's `min` preset already sets (`sm_maxLights 1`, `r_spotLightEntityShadows 0`, `r_spotLightSModelShadows 0`,
+  `sm_qualitySpotShadow 0`, `sm_sunShadowScale 0.25`, `sm_sunShadowSmallEnable 1`). `sm_sunEnable`, `sm_spotEnable` and
+  `r_spotLightShadows` are documented but changed nothing in this build's frame trace.
+- **New lead from it:** shrink the sun shadow range further for `min` (`sm_sunShadowScale` and `sm_sunSampleSizeNear`
+  below 0.25) so the game stops generating the caster draws `min` discards. Not tested yet.
+- **Effects:** `fx_cull_effect_spawn` (default 0) and the other culling dvars are the useful part for busy scenes. Built
+  as the `bo1_fx_lite` test preset (`fx_cull_effect_spawn 1`, `fx_cull_elem_spawn 1`, `fx_cull_elem_draw 1`,
+  `fx_drawClouds 0`, `ai_corpseCount 3`); the Mac accepts them, and the console test is still pending. `r_glow` and
+  `r_distortion` are further candidates (the port already sets `r_distortion 0`).

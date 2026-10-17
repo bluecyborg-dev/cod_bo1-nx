@@ -25,3 +25,25 @@
 
 Each of these steps targets a concrete hotspot: draw-call overhead and state changes first (CPU-bound), then GPU load and system-level tweaks. Together they should substantially improve stability and help hit or approach 30 FPS on the Switch.
 
+
+---
+
+## Review notes (bo1-nx, 2026-10-16/17)
+
+A shorter, earlier draft of the same research as `black_ops_switch_performance_research.md`. Nothing in it is new, and
+several claims are wrong for this port:
+
+- **Multi-draw "cuts CPU draw overhead by 50-75 %":** assumes the per-draw cost is the Vulkan call. The console profile
+  puts most of it in the port's own PM4 translation work, which a multi-draw call does not remove, and BO1's stream has
+  few long runs of state-identical draws to batch.
+- **"Update to Mesa 26.x":** already done; the pin is mesa-switch d4a00ea0ab3 (Mesa 26.2.3), and the CB0 updates it
+  cites are in it.
+- **"800x450 halves the pixel count":** it removes 31 %, and the port renders 1040x608, not 960x544.
+- **"Render thread above 0x3B, real-time":** misreads Horizon priorities (0-0x3F, lower number = higher priority). The
+  renderer ring thread already runs at 0x2C; only 0x3B is time-sliced.
+- **deko3d "avoids Vulkan's validation layers":** no validation layers are active in the console build.
+- **"Command capture" of static state:** no static runs measured yet; the same caveat as multi-draw applies.
+
+Only the "turn off costly effects through dvars" point stands. Busy scenes are confirmed as the source of the
+remaining stutters (frames of 70-199 ms average ~1,370 draws against ~860), and the effect-culling dvars are being
+tested as `bo1_fx_lite`.

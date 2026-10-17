@@ -246,3 +246,35 @@ for that (fewer shadowed lights, no entity/static-model casters, small sun map) 
 Useful for the hounds round: `fx_cull_effect_spawn` (default 0 → 1), `fx_drawClouds`, `r_glow`.
 New lead: shrink the sun shadow range further for `min` (`sm_sunShadowScale` < 0.25, `sm_sunSampleSizeNear` < 0.25) so
 the game stops generating the caster draws `min` discards.
+
+## Fifth pass (2026-10-17): Prototype and Prototype 2 (Xbox 360, ReXGlue)
+
+Sources: [fungalspores/prototype-switch](https://github.com/fungalspores/prototype-switch) (Prototype, and a rebuild
+of Prototype 2; created 2026-10-15, GPL-3.0) and [penettrator/prototype2-nx](https://github.com/penettrator/prototype2-nx)
+(Prototype 2 0.2.0, GPL-3.0). A Reddit thread about a Prototype free-roam test with an overclock could not be read
+(Reddit blocks automated access). Read for ideas only; no code taken.
+
+**Why they matter:** the closest ports to ours so far. Same stack: ReXGlue, the masseffect-nx SDK with its Horizon
+layer, a native renderer from the project8-sw lineage, and mesa-switch at the same commit as ours (`d4a00ea0ab3`).
+Both play. Reported FPS: Prototype 25-30 in gameplay, Prototype 2 25-30 in the city, but on an OLED (Mariko) overclocked
+to CPU 1785 / GPU 768-1152 / RAM 2333 MHz; "lower at stock clocks". Prototype 2 renders at 960x544 (its own release:
+800x448) and upscales with FSR 1.
+
+What is new for us, roughly by expected value:
+
+| Idea | What they did | Relevance to BO1 |
+|---|---|---|
+| **Fourth CPU core** | The homebrew loader's NPDM allows cores 0-2 only. Their HOME-menu NSP forwarder (Forwarder-Mod) sets `highest_cpu_id` 3 in both permission tables (ACID and ACI0); `tools/patch_hbl_core3.py` makes the same 2-byte change to one verified `hbl.nsp`. Thread masks then spread the game: guest threads 0-3, main thread 1-3, audio engine on core 3 only, host threads 1-2. "System services also use core 3; permission does not grant exclusive ownership." | Large potential: our process has 3 cores (profiler: mask 0x7) and they run at 240-298 % of 300 %. Needs either a patched `atmosphere/hbl.nsp` on the user's SD or an NSP forwarder built with the user's own `prod.keys`; both are the user's call. Then put the audio/XMA/background threads on core 3. |
+| **Main-thread priority** | Profiling showed the game's main loop got ~70 % of a core while ~16 job workers shared its priority 0x3B. They raise that one thread to 0x3A (below the host present/audio threads at 0x2C/0x2B) and pin it to core 0, away from host threads. | Same shape as BO1 (Main XThread at 0x3B beside the JQ workers and Backend). Risk: at 0x3A the thread is no longer time-sliced, and its job-wait loop yields; a yield only gives way to the same priority, so a spinning wait could starve the 0x3B workers on that core. Test with the job throttle in place. |
+| **Immediate guest flip** | The game's D3D scheduled each flip for "last flip + present interval" or the next vblank when late, so 35-60 ms of work became 50/67/83 ms frames. They flip at the current vblank and let the host presenter pace the screen, with a minimum interval of 2 vblanks. | Worth checking: our slow-frame lines report "game's vblank wait", usually 0 ms, so BO1 may not wait there. Look at its swap/flip path before assuming. |
+| **Hash less in the renderer** | Changing buffers are copied once per frame with no hash first; ranges that stopped changing (≥16 KB) are checked by samples plus a full hash every 16 frames; small ranges unchanged for 300 frames are hashed only every 4th frame; ranges on pages the skinning code just wrote get a new identity instead of a hash. | Directly aimed at our renderer's hot spot: ~40 % of the ring thread in XXH3/memcmp/memmove. Correctness risk (a change seen up to N-1 frames late), so keep exact-check switches. |
+| **PGO that survives HOME exits** | An instrumented build dumps the gcov counters to `sdmc:/pgo` every 3 minutes (`__gcov_dump` + `__gcov_reset` on a helper thread); any 3+ minute session leaves a profile. Arc counts only (`-fno-profile-values`), same GCC (15.2) and build-directory layout for GEN and USE; 222 profiles cover guest and native code. Training builds stall, so never benchmark them. | Solves our noted PGO blocker (the game is closed with HOME, so counters never flush at exit). Goes with guest LTO, which needs more RAM than this Mac's Docker has (~16 GB for LTO links). |
+| **Codegen** | `cr/non_volatile/xer/ctr_as_local` with `share_registers` for guest setjmp, the fiber switch and a non-ABI helper pair (found with masseffect-nx's `read_before_write.py`); direct calls, guest LTO, leaf locals, integer VMX on NEON (`P2_ARM_VMX`). Per-address locks for lwarx/stwcx. regions instead of one process-wide mutex. | Known items (checklist "Codegen"). New detail: how they made `non_volatile_as_local` safe with setjmp, our blocker (`Com_Error`). Check how our SDK serializes reservations. |
+| **GPU bandwidth** | 32-bit depth instead of D32F_S8 (64 bpp on NVIDIA); HDR scene as R11G11B10; colour resolves and the shadow atlas done with fragment passes instead of compute, because every switch between drawing and compute idles this GPU; far shadow cascades capped or redrawn on alternate frames. | `bo1_native_depth24` exists but was never tested on the console: a cheap A/B. BO1's main colour target is 8_8_8_8, so R11G11B10 does not apply. Check whether our resolves alternate compute and graphics. |
+| **Native hot routine with verification** | The job workers' culling routine (5.8 % of a core) rewritten with NEON; the first 256 calls run both versions and compare every result, and a mismatch turns the native path off. | The pattern for any BO1 hot function we replace. |
+| **Hangs and saves** | Main thread holding critical sections while waiting for the render thread to drain a full command ring: it now releases them while it waits. `XFile::Write`/`SetLength` returned the size cached at open (0), so saves looked corrupt. Console signature stubs (`XeKeysConsolePrivateKeySign`, `...SignatureVerification`) returned "invalid". | Check our SDK for the same `XFile` size bug and the XeKeys stubs before testing BO1 saves. |
+| **Horizon OC crash** | An open temperature-sensor (`ts`) session for the whole game coincided with Horizon OC's `hoc:clk` crashing under load. They stopped polling it. | Check our SDK's clock/temperature code (`switch_sysclk.cpp`). |
+| **Release packaging** | NSP forwarders on the HOME menu; `rex-start`, a small libnx launcher that shows the game for 5 s and offers a settings screen writing straight into the game's TOML; release builds without stack/task audits or the SDK profiler. | Later, for a public release. |
+
+Their other settings match ours in spirit: MSAA off, recording thread on, pipeline prewarm, async pipelines, a
+depth-prepass skip (LESS/LEQUAL, theirs) and per-pass GPU profiling.

@@ -31,6 +31,34 @@ Rules for every step (from nfsmw-nx and masseffect-nx `measuring.md`):
 
 ### Next
 
+**Candidates from the Prototype ports (recorded 2026-10-17, none tested yet).** From fungalspores/prototype-switch
+and penettrator/prototype2-nx (same stack as ours; details in `docs/OTHER_PORTS_RESEARCH.md`, fifth pass, and
+nx-port-guide `08-prior-port-research-database.md`). In order of expected value:
+
+1. [ ] **Fourth CPU core.** The homebrew loader's NPDM allows cores 0-2; our three run at 240-298 % of 300 %.
+   **Decision (user, 2026-10-17): an NSP forwarder**, not a patched `atmosphere/hbl.nsp`. Build it with
+   Forwarder-Mod (as Prototype 2's `tools/build_forwarder.sh`): `highest_cpu_id` 3 in both NPDM tables (ACID and
+   ACI0), target `sdmc:/switch/bo1-nx/bo1-nx.nro`, our own title ID, built with the user's own `prod.keys` (read
+   locally, never committed or published). Then give the SDK core masks for core 3 (audio/XMA and background threads
+   there; system services also run on it, so it is shared) and A/B against the 3-core launch. Wi-Fi testing still
+   works: the forwarder loads the NRO that nxlink uploads to the same path.
+2. [ ] **Hash less in the renderer.** Hashing, compares and copies are ~40 % of our ring thread. Prototype 2's
+   renderer copies buffers that change every frame without hashing them first, checks settled ranges of 16 KB or more
+   by samples plus a full hash every 16 frames, hashes small settled ranges every 4th frame, and gives pages a CPU
+   routine just wrote a new identity. Keep an exact-check switch (a change can be seen frames late).
+3. [ ] **`bo1_native_depth24` A/B** (exists, off, never tested on the console; launch option only): depth at 32 bits
+   per pixel instead of D32F_S8, which NVIDIA keeps at 64. The scene depth is `kD24FS8`; check BO1's stencil use
+   first. Prototype 2 ships the equivalent on.
+4. [ ] **Main XThread at priority 0x3A** instead of 0x3B beside the JQ workers and Backend (Prototype 2's main loop got
+   ~70 % of a core before). Risk: its job-wait loop yields, and a yield does not give way to the 0x3B threads, so it
+   could starve them on its core; test with the job throttle in place.
+5. [ ] **PGO trained on the console.** The instrumented build dumps and resets the gcov counters to `sdmc:/pgo` every
+   3 minutes (the game is closed with HOME, so they never flush at exit); `-fno-profile-values`, same GCC and build
+   layout for GEN and USE; never benchmark the instrumented build. Then rebuild with the profiles. LTO on top needs
+   more RAM than this Mac's Docker has.
+
+Still pending from the last sessions: `bo1_fx_lite` (effect culling dvars) on the console, with the Wi-Fi log working.
+
 - [ ] **Console CPU profile in Kino** (SDK stack sampler: `--bo1_profile_stacks=true --bo1_profile_log=true` sends
   each 10 s report to the Wi-Fi log, no flag file on the SD card needed): which guest
   thread and function holds the heavy moments with shadows off (125-147 swaps per 10 s with the renderer idle) and
@@ -60,6 +88,8 @@ Rules for every step (from nfsmw-nx and masseffect-nx `measuring.md`):
   bandwidth, edges get rougher. Console A/B pending.
 - [ ] Fewer passes and barriers (each is a wait for idle on NVK); skip resolves nobody reads.
 - [ ] Depth-only pipelines without a fragment stage.
+- [ ] Count compute dispatches between draws (resolves, conversions): each switch between drawing and compute idles
+  this GPU (Prototype 2 moved its resolves to fragment passes).
 
 ### Renderer thread (CPU per draw)
 
@@ -82,14 +112,21 @@ Rules for every step (from nfsmw-nx and masseffect-nx `measuring.md`):
 - [ ] Range cache for the reread streaming archives (`images.pak`, `snd.all.pak`).
 - [ ] `guest_memory_large_pages` A/B (modes 1 and 2).
 - [ ] CPU boost mode during loading screens only.
+- [ ] Check BO1's guest flip scheduling: Prototype 2's D3D queued flips to later vblanks (35-60 ms of work became
+  50/67/83 ms frames). Our slow-frame lines show "game's vblank wait" near 0, so probably not, but confirm.
+- [ ] Before testing saves: check the SDK's `XFile::Write`/`SetLength` (returned the size cached at open in
+  Prototype) and the `XeKeysConsolePrivateKeySign` / `...SignatureVerification` stubs.
 
 ### Faster guest code
 
 - [ ] Direct calls instead of weak aliases.
 - [ ] Float moves without FPCR mode switches (`fp_moves_modeless`).
-- [ ] Non-volatile registers as locals / no LR stores (needs shared registers for setjmp/SEH).
+- [ ] Non-volatile registers as locals / no LR stores (needs shared registers for setjmp/SEH; Prototype 2 found its
+  exceptions with masseffect-nx's `read_before_write.py` and marks only those functions `share_registers`).
 - [ ] "Diet" lowerings.
-- [ ] LTO + PGO, hot function ordering (experiment).
+- [ ] LTO + PGO, hot function ordering (see "Candidates from the Prototype ports" in Next for console PGO).
+- [ ] Per-address locks for lwarx/stwcx. regions instead of one process-wide mutex (Prototype); check how our SDK
+  serializes reservations.
 - [ ] Native memcpy.
 
 ### Longer term
