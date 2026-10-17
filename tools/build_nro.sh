@@ -10,8 +10,11 @@
 #   3. mesa/build_mesa_docker.sh      the NVK Vulkan driver: <MESA_SDK>/opt/devkitpro/portlibs/switch/lib/libvulkan.a
 #
 # Environment (all optional):
-#   MESA_SDK   folder produced by mesa/build_mesa_docker.sh (default out/mesa-sdk)
+#   MESA_SDK   folder produced by mesa/build_mesa_docker.sh (default out/mesa-sdk-direct, the driver with
+#              mesa-switch-p8-direct-draws.patch)
 #   NRO_OUT    build folder, relative to the repository (default out/nx)
+#   PLAIN_MEMORY ON (default) or OFF: BO1_GUEST_PLAIN_MEMORY, passed explicitly so an older build folder follows it
+#   CMAKE_EXTRA  more CMake options
 #   JOBS       parallel compile jobs inside the container (default 4; each needs 1-2 GB of Docker memory)
 #   IMAGE      Docker image (default devkitpro/devkita64:latest)
 set -euo pipefail
@@ -21,7 +24,8 @@ SDK_DIR="$ROOT/sdk"
 NRO_OUT="${NRO_OUT:-out/nx}"
 JOBS="${JOBS:-4}"
 IMAGE="${IMAGE:-devkitpro/devkita64:latest}"
-MESA_SDK="${MESA_SDK:-$ROOT/out/mesa-sdk}"
+MESA_SDK="${MESA_SDK:-$ROOT/out/mesa-sdk-direct}"
+PLAIN_MEMORY="${PLAIN_MEMORY:-ON}"
 
 command -v docker >/dev/null 2>&1 || { echo "error: docker not found in PATH" >&2; exit 1; }
 docker info >/dev/null 2>&1 || { echo "error: the Docker daemon is not running" >&2; exit 1; }
@@ -46,11 +50,13 @@ case "$MESA_SDK/" in "$ROOT"/*) ;; *) mounts+=(-v "$MESA_SDK:$MESA_SDK:ro") ;; e
 echo "== configure and build ($NRO_OUT, -j$JOBS, image $IMAGE)"
 docker run --rm "${mounts[@]}" -w "$ROOT" \
   -e JOBS="$JOBS" -e ROOT="$ROOT" -e SDK_DIR="$SDK_DIR" -e MESA_SDK="$MESA_SDK" -e NRO_OUT="$NRO_OUT" \
+  -e CMAKE_EXTRA="${CMAKE_EXTRA:-}" -e PLAIN_MEMORY="$PLAIN_MEMORY" \
   "$IMAGE" bash -euo pipefail -c '
     cmake -S app -B "$NRO_OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$ROOT/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro -DREXSDK_DIR="$SDK_DIR" \
-      -DREXGLUE_SWITCH_NVK_SDK="$MESA_SDK/opt/devkitpro/portlibs/switch"
+      -DREXGLUE_SWITCH_NVK_SDK="$MESA_SDK/opt/devkitpro/portlibs/switch" \
+      -DBO1_GUEST_PLAIN_MEMORY="$PLAIN_MEMORY" $CMAKE_EXTRA
     cmake --build "$NRO_OUT" -j "$JOBS"
     # crt0 must be first in .text or the NRO does not boot
     /opt/devkitpro/devkitA64/bin/aarch64-none-elf-nm "$NRO_OUT/bo1" | grep "^0000000000000000 T _start$" >/dev/null

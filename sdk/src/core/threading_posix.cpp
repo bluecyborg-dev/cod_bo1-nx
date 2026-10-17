@@ -8,6 +8,7 @@
 
 #include <rex/platform.h>
 #include <rex/thread.h>
+#include <rex/cvar.h>
 
 static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
 
@@ -86,6 +87,10 @@ REXCVAR_DEFINE_INT32(thread_alertable_slice_ms, 8, "Threading",
 REXCVAR_DEFINE_INT32(thread_multiwait_safety_ms, 20, "Threading",
                      "With thread_wait_blocking: a parked WaitMultiple re-polls its handles at least this "
                      "often even if nobody poked it (safety net against a state change that did not notify)");
+
+// bo1-nx: PulseEvent without its yield and 10 us sleep when that is exact (see PosixCondition<Event>::TryPulse).
+REXCVAR_DEFINE_BOOL(event_pulse_fast, true, "Kernel",
+                    "PulseEvent with nobody waiting (or an auto-reset event with waiters) without a yield and sleep");
 
 namespace rex::thread {
 
@@ -626,6 +631,8 @@ class PosixConditionBase {
   // blocked (or about to block) in Wait() on cond_. Lets a state change skip cond_.notify_all() when nobody can be
   // waiting on it; on Horizon a notify is a system call even with no waiter (svcSignalProcessWideKey).
   bool has_cond_waiters() const { return cond_waiters_ != 0; }
+  // bo1-nx: whether a WaitMultiple call is parked on this handle.
+  bool has_multi_waiters() const { return multi_count_.load(std::memory_order_seq_cst) != 0; }
   std::condition_variable cond_;
   std::mutex mutex_;
   // Threads inside Wait() between their failed predicate check and their return; guarded by mutex_.
@@ -670,6 +677,33 @@ class PosixCondition<Event> : public PosixConditionBase {
   void Reset() {
     auto lock = std::unique_lock<std::mutex>(mutex_);
     signal_ = false;
+  }
+
+  // bo1-nx: PulseEvent without the yield and sleep when it can be exact. With nobody waiting a pulse only leaves the
+  // event reset. An auto-reset event with waiters is signalled once: the first waiter to wake consumes it (resetting
+  // it), as a pulse releases one waiter. Returns false for a manual-reset event with waiters, which needs every
+  // current waiter released before the reset (the caller's slow path). BO1's job queue pulses an event for each job
+  // it adds: on the Mac its main thread spent ~70 % of its time in the slow path's yield.
+  bool TryPulse() {
+    bool notify;
+    {
+      auto lock = std::unique_lock<std::mutex>(mutex_);
+      const bool waiters = has_cond_waiters() || has_multi_waiters();
+      if (!waiters) {
+        signal_ = false;
+        return true;
+      }
+      if (manual_reset_) {
+        return false;
+      }
+      signal_ = true;
+      notify = has_cond_waiters();
+    }
+    if (notify) {
+      cond_.notify_all();
+    }
+    NotifyMulti();
+    return true;
   }
 
  private:
@@ -1702,6 +1736,9 @@ class PosixEvent : public PosixConditionHandle<Event> {
   void Reset() override { handle_.Reset(); }
   void Pulse() override {
     using namespace std::chrono_literals;
+    if (REXCVAR_GET(event_pulse_fast) && handle_.TryPulse()) {
+      return;
+    }
     handle_.Signal();
     MaybeYield();
     Sleep(10us);

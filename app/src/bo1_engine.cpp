@@ -16,16 +16,21 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #include <fmt/format.h>
 #include <rex/cvar.h>
+#include <rex/platform.h>
 
 #include "native/bo1_native_system.h"
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
+#include <rex/system/xthread.h>
 
 namespace {
 
@@ -110,6 +115,17 @@ std::string FormatGuest(PPCContext& ctx, uint8_t* base, uint32_t format) {
 // a thread that keeps finding the job queue empty in a tight loop sleeps 100 us per poll, and a zero-timeout poll that
 // timed out 256 times in a row on the same handle waits up to 1 ms (returning as soon as the handle is signaled).
 // Results are unchanged; only the spinning is gone.
+//
+// A third one, found with the console stack sampler (2026-10-16, Kino der Toten, shadows off at the 20 FPS cap: the
+// three cores at 300 %, the two job queue workers at ~50-67 % each):
+//
+//   JQ Worker: sub_82545308 (the worker loop) asks sub_825450A8 for a job (it scans 8 priority lists and yields when
+//              all are empty) and, when there is none, calls sub_825444B8. That one waits on the queue's event (1 ms
+//              timeouts; the producer pulses it per job) only while the "jobs pending" count is 0; while any job is
+//              still running elsewhere the count stays above 0, so it just yields and returns, and the worker spins.
+//
+// The console profile then showed the workers rarely find the lists empty: a job whose callback returns "not finished"
+// is put back on its list and handed out again at once (see the hook on sub_82546470 below), which is the spin.
 
 namespace {
 
@@ -141,6 +157,70 @@ REX_HOOK_RAW(sub_825443F0) {
   last_empty_ns = now;
   if (empty_streak >= kEmptyPollsBeforeSleep) {
     std::this_thread::sleep_for(kIdleSleep);
+  }
+}
+
+REXCVAR_DEFINE_INT32(bo1_job_worker_sleep_us, 100, "bo1",
+                     "Job queue workers that keep requeuing an unfinished job in a tight loop sleep this long per pass "
+                     "(0 = spin as the game does)")
+    .range(0, 2000);
+
+// sub_82546470(list, job) appends a 124-byte job to one of the job queue's lock-free lists. The worker loop calls it at
+// 0x8254551C for a job whose callback returned "not finished" (non-zero): the job goes back on its list and the next
+// sub_825450A8 hands it straight out again, so a job that waits for something keeps two workers spinning. The
+// helpers' "run one job" (sub_82545618, called by Backend's wait loop sub_8238FC18 through sub_82545D98 and by other
+// threads waiting for jobs) requeues the same way at 0x82545788: with only the workers throttled, Backend took the
+// spin over (20-28 % -> 50-77 % of a core on the console). Such a
+// requeue less than kTightPollNs after the previous one on the same thread belongs to that loop; from the 16th in a row
+// the thread sleeps bo1_job_worker_sleep_us after it (0 = the game's own spinning). The job is already back on its list,
+// so another thread can still take it; only the polling slows down. The game's main thread also runs "run one job"
+// (sub_8238FB98 -> sub_82545D98) while it waits for jobs; sleeping there put 19 % of its time in these sleeps and added
+// input lag on the console, so the main thread is never throttled.
+constexpr uint32_t kRequeuesBeforeSleep = 16;
+constexpr uint32_t kWorkerRequeueReturn = 0x8254552C;  // sub_82545308, the workers' loop
+constexpr uint32_t kHelperRequeueReturn = 0x8254578C;  // sub_82545618, "run one job"
+
+std::atomic<uint64_t> g_requeues{0}, g_requeue_sleeps{0};
+
+REX_EXTERN(__imp__sub_82546470);
+REX_HOOK_RAW(sub_82546470) {
+  const bool requeue = ctx.lr == kWorkerRequeueReturn || ctx.lr == kHelperRequeueReturn;
+  uint32_t callback = 0;
+  if (requeue) {
+    // The job's type is at +12 and its callback at type+8 (as the worker loop reads them).
+    uint32_t type = 0;
+    std::memcpy(&type, base + ctx.r4.u32 + 12, 4);
+    type = __builtin_bswap32(type);
+    if (type) {
+      std::memcpy(&callback, base + type + 8, 4);
+      callback = __builtin_bswap32(callback);
+    }
+  }
+  __imp__sub_82546470(ctx, base);
+  if (!requeue) return;
+  g_requeues.fetch_add(1, std::memory_order_relaxed);
+  thread_local uint64_t last_ns = 0;
+  thread_local uint32_t streak = 0;
+  const uint64_t now = NowNs();
+  streak = (now - last_ns < kTightPollNs) ? streak + 1 : 0;
+  last_ns = now;
+  thread_local const bool main_thread = [] {
+    auto* thread = rex::system::XThread::GetCurrentThread();
+    return thread && thread->main_thread();
+  }();
+  const int32_t sleep_us = REXCVAR_GET(bo1_job_worker_sleep_us);
+  if (sleep_us > 0 && streak >= kRequeuesBeforeSleep && !main_thread) {
+    g_requeue_sleeps.fetch_add(1, std::memory_order_relaxed);
+    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+  }
+  // Every 10 s: how many requeues, how many sleeps, and the callback of the last job requeued by this thread.
+  static std::atomic<uint64_t> report_ns{0};
+  uint64_t due = report_ns.load(std::memory_order_relaxed);
+  if (!due) {
+    report_ns.compare_exchange_strong(due, now + 10'000'000'000ull);
+  } else if (now >= due && report_ns.compare_exchange_strong(due, now + 10'000'000'000ull)) {
+    REXLOG_INFO("bo1: job queue last 10 s: {} jobs requeued as not finished, {} sleeps of {} us (last callback {:08X})",
+                g_requeues.exchange(0), g_requeue_sleeps.exchange(0), sleep_us, callback);
   }
 }
 
@@ -350,6 +430,60 @@ REXCVAR_DEFINE_STRING(bo1_debug_exec, "", "bo1",
                       "devmap+zombie_theater");
 REXCVAR_DEFINE_INT32(bo1_debug_exec_delay_s, 20, "bo1",
                      "Debug: seconds after the first cinematic job before bo1_debug_exec is queued");
+// The SDK's console profiler (sdk/src/ui/switch_perf.cpp) appends a report to logs/rex/rex_profile.log on the SD card
+// every 10 s: CPU per thread, libnx call counts and, with stack sampling, where each thread spends its time. These two
+// settings turn sampling on without the flag file on the card and copy every report into the log, so a Wi-Fi session
+// (tools/nxlink_run.sh) brings it back to the Mac. Addresses come out as image+0x...: resolve them with addr2line on
+// the ELF of that build (out/nx/bo1).
+REXCVAR_DEFINE_BOOL(bo1_profile_stacks, false, "bo1",
+                    "Switch: sample every thread's stack at 1 kHz for the profiler report (pauses each thread "
+                    "briefly); same as logs/rex/stacks_profile.flag");
+REXCVAR_DEFINE_BOOL(bo1_profile_log, false, "bo1",
+                    "Switch: copy every 10 s profiler report (logs/rex/rex_profile.log) into the log");
+
+#if defined(__SWITCH__)
+extern "C" bool RexSwitchPerfStacksWanted(void) { return REXCVAR_GET(bo1_profile_stacks); }
+
+// The profiler calls this on its own thread, which runs at a high priority (0x2A) and pauses other threads to sample
+// them: it must not log there (a log call takes the logger's lock and writes to the SD card and the network). The
+// report only goes into a buffer; Bo1StartProfileLog's thread, at a normal priority, sends it to the log.
+namespace {
+std::mutex g_profile_mutex;
+std::string g_profile_text;
+}  // namespace
+
+extern "C" void RexSwitchPerfReportText(const char* text, size_t len) {
+  if (!REXCVAR_GET(bo1_profile_log)) return;
+  std::lock_guard<std::mutex> lock(g_profile_mutex);
+  if (g_profile_text.size() + len <= (512u << 10)) g_profile_text.append(text, len);
+}
+
+void Bo1StartProfileLog() {
+  if (!REXCVAR_GET(bo1_profile_log)) return;
+  // Never joined: it lives as long as the process (a joinable std::thread destroyed at exit would terminate).
+  new std::thread([] {
+    std::string text;
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      {
+        std::lock_guard<std::mutex> lock(g_profile_mutex);
+        text.swap(g_profile_text);
+      }
+      std::string_view rest(text);
+      while (!rest.empty()) {
+        const size_t end = rest.find('\n');
+        const std::string_view line = rest.substr(0, end);
+        if (!line.empty()) REXLOG_INFO("[profile] {}", line);
+        if (end == std::string_view::npos) break;
+        rest.remove_prefix(end + 1);
+      }
+      text.clear();
+    }
+  });
+}
+#else
+void Bo1StartProfileLog() {}
+#endif
 // Engine settings (dvars) for the console, as the CoD4 port does (codmw_dvars): set 10 s after the first cinematic job
 // and again every 5 s, in case a map script sets one back. The default turns off what costs the most on the Switch
 // for the least visible loss: dynamic shadows (sm_enable 0: the sun's cascades and the spot lights' maps were ~3,100 of
@@ -371,10 +505,42 @@ REXCVAR_DEFINE_STRING(bo1_dvars,
                       "r_dof_enable 0; r_distortion 0; r_flameFX_enable 0; cg_brass 0; fx_marks_smodels 0; "
                       "ragdoll_enable 0",
                       "bo1", "Engine settings to apply (\"dvar value; dvar value\"; empty = the game's own)");
+// Test preset for the frames that stutter: on the console (2026-10-16) the frames of 70-199 ms averaged ~1,370 draws
+// against ~860 for an average frame (GPU wait 23 ms): crowds and effects. These skip particle effects and elements
+// that are off screen or too small, drop the big particle clouds, and keep fewer corpses. Added to bo1_dvars.
+REXCVAR_DEFINE_BOOL(bo1_fx_lite, false, "bo1",
+                    "Fewer effects: fx_cull_effect_spawn/elem_spawn/elem_draw 1, fx_drawClouds 0, ai_corpseCount 3");
+REXCVAR_DECLARE(bool, bo1_native_skip_shadow_maps);
 REXCVAR_DEFINE_STRING(bo1_shadows, "off", "bo1",
-                      "Dynamic shadows, applied after bo1_dvars: off (sm_enable 0: fastest, but models flicker between "
-                      "lit and dark near lights), lite (one spot light, world casters only, short sun shadow range, low "
-                      "quality), full (the game's own), or empty to leave them to bo1_dvars");
+                      "Dynamic shadows, live (settings menu: L+R+Right): off (sm_enable 0: fastest, but models flicker "
+                      "between lit and dark near lights), min (the shadow system on with the least it can draw, and no "
+                      "shadow map drawn: no dynamic shadows and no flicker), or none to leave them to bo1_dvars")
+    .allowed({"off", "min", "none"});
+
+#if REX_PLATFORM_SWITCH
+#include <rex/input/switch/switch_input_driver.h>
+#endif
+
+// Hold MINUS and press D-pad Right/Left in game: the next/previous bo1_shadows preset, applied within half a second by
+// MaybeApplyDvars (as a change in the settings menu would be).
+void Bo1CycleShadows(int direction) {
+  static const char* const kPresets[] = {"off", "min"};
+  constexpr int kCount = int(std::size(kPresets));
+  const std::string current = REXCVAR_GET(bo1_shadows);
+  int index = 0;
+  for (int i = 0; i < kCount; ++i) {
+    if (current == kPresets[i]) index = i;
+  }
+  index = (index + direction + kCount) % kCount;
+  REXCVAR_SET(bo1_shadows, kPresets[index]);
+  REXLOG_INFO("bo1: MINUS + D-pad: shadows {}", kPresets[index]);
+}
+
+void Bo1RegisterShadowCombo() {
+#if REX_PLATFORM_SWITCH
+  rex::input::nx::SetMinusDpadHandler(&Bo1CycleShadows);
+#endif
+}
 
 REX_EXTERN(__imp__sub_8232EA30);
 namespace {
@@ -424,6 +590,48 @@ int32_t ReadStreamDvar(uint8_t* base) {
   return int32_t(be32(dvar + 0x18));
 }
 
+// Finds a dvar_t by its name string's guest address. The dvars live in one pool; r_stream's (found through its
+// pointer) is in it, so the pool is searched around it. Returns 0 when not found.
+uint32_t FindDvarByName(uint8_t* base, uint32_t name_address) {
+  auto be32 = [&](uint32_t a) {
+    uint32_t v;
+    std::memcpy(&v, base + a, 4);
+    return __builtin_bswap32(v);
+  };
+  const uint32_t anchor = be32(kStreamDvarPointer);
+  if (!anchor || anchor >= 0xA0000000u || be32(anchor) != kStreamDvarName) return 0;
+  constexpr uint32_t kRange = 4u << 20;
+  const uint32_t begin = anchor > kRange ? anchor - kRange : 0;
+  for (uint32_t a = begin & ~3u; a < anchor + kRange; a += 4) {
+    if (be32(a) == name_address && be32(a + 0x10) <= 10) return a;
+  }
+  return 0;
+}
+
+// Writes a dvar's current and latched value directly, for the dvars whose "set" only takes effect at the next map
+// load (sm_sunShadowScale). Types seen: 0 bool (a byte), 1 float, 5 int.
+bool WriteDvarDirect(uint8_t* base, uint32_t dvar, const char* value) {
+  uint32_t type;
+  std::memcpy(&type, base + dvar + 0x10, 4);
+  type = __builtin_bswap32(type);
+  uint32_t word;
+  if (type == 0) {
+    base[dvar + 0x18] = base[dvar + 0x28] = uint8_t(std::atoi(value) != 0);
+    return true;
+  } else if (type == 1) {
+    const float f = float(std::atof(value));
+    std::memcpy(&word, &f, 4);
+  } else if (type == 5) {
+    word = uint32_t(std::atoi(value));
+  } else {
+    return false;
+  }
+  word = __builtin_bswap32(word);
+  std::memcpy(base + dvar + 0x18, &word, 4);
+  std::memcpy(base + dvar + 0x28, &word, 4);
+  return true;
+}
+
 void MaybeToggleStreaming(PPCContext& ctx, uint8_t* base) {
   (void)ctx;
   if (!REXCVAR_GET(bo1_stream_off_in_game) || !bo1::native::Enabled()) return;
@@ -455,25 +663,60 @@ void MaybeToggleStreaming(PPCContext& ctx, uint8_t* base) {
   }
 }
 
+// The console commands of a bo1_shadows preset. "min" keeps the shadow system on (with it off, models near lights
+// alternate between lit and dark every frame) and sets it to draw as little as it can: one light, no character or
+// static model casters, small low-quality maps, a quarter of the sun's range; the renderer then skips every shadow map
+// draw (bo1_native_skip_shadow_maps). The game's own values (sub_8258CDA8's dvar registration) are 4 lights, both
+// caster kinds, quality 1, sun scale 1, small sun map off; "off" leaves the system off, where the others do not
+// matter. sm_sunEnable, sm_spotEnable and r_spotLightShadows are not used: setting them changed nothing in a frame
+// trace. (lite, medium and full presets, which drew the maps, were tried on 2026-10-16 and dropped:
+// docs/OPTIMIZATION_LOG.md.)
+std::string ShadowCommands(const std::string& preset) {
+  if (preset == "off") return "set sm_enable 0";
+  if (preset != "min") return {};
+  return "set sm_enable 1; set sm_maxLights 1; set r_spotLightEntityShadows 0; set r_spotLightSModelShadows 0; "
+         "set sm_qualitySpotShadow 0; set sm_sunShadowScale 0.25; set sm_sunShadowSmallEnable 1";
+}
+
+// The values of a preset for the dvars that "set" does not change until the next map load (sm_sunShadowScale: when
+// switched live, the sun shadow stayed at its old size), written straight into the dvars as well.
+void WriteLatchedShadowDvars(uint8_t* base, const std::string& preset) {
+  struct Latched {
+    uint32_t name_address;  // the name string in default.xex
+    const char *off, *min;
+  };
+  static const Latched kLatched[] = {
+      {0x820D6E0C, "1", "0.25"},  // sm_sunShadowScale
+  };
+  static uint32_t dvars[std::size(kLatched)] = {};
+  for (size_t i = 0; i < std::size(kLatched); ++i) {
+    const Latched& row = kLatched[i];
+    const char* value = preset == "min" ? row.min : preset == "off" ? row.off : nullptr;
+    if (!value) continue;
+    if (!dvars[i]) {
+      dvars[i] = FindDvarByName(base, row.name_address);
+      if (dvars[i]) {
+        uint32_t type;
+        std::memcpy(&type, base + dvars[i] + 0x10, 4);
+        REXLOG_INFO("bo1: dvar with name {:08X} at {:08X}, type {}", row.name_address, dvars[i],
+                    __builtin_bswap32(type));
+      }
+    }
+    if (!dvars[i] || !WriteDvarDirect(base, dvars[i], value)) {
+      REXLOG_WARN("bo1: could not write the dvar at name {:08X} directly", row.name_address);
+    }
+  }
+}
+
 void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
-  // All the settings once; afterwards every 5 s all but r_stream*: writing r_stream (even with the same value) while a
-  // map loads restarts the streaming system and the load never finished (reproduced on the Mac and the console).
+  // bo1_dvars once; afterwards every 5 s all but r_stream*: writing r_stream (even with the same value) while a map
+  // loads restarts the streaming system and the load never finished (reproduced on the Mac and the console). The
+  // shadow preset goes with them, and also at once when it is changed in the settings menu.
   static std::string periodic;
   static const std::string commands = [] {
     std::string list = REXCVAR_GET(bo1_dvars);
-    const std::string shadows = REXCVAR_GET(bo1_shadows);
-    if (shadows == "off") {
-      list += "; sm_enable 0";
-    } else if (shadows == "lite" || shadows == "min") {
-      // The shadow system stays on (with it off, models near lights alternate between lit and dark every frame);
-      // what it draws is cut down: one spot light, no static model or entity casters, a small low quality map, and
-      // the sun's shadow over a quarter of the distance (its two passes were ~2,850 draws a frame, now ~700).
-      // sm_sunEnable, sm_spotEnable and r_spotLightShadows are not used: setting them changed nothing.
-      list += "; sm_enable 1; sm_maxLights 1; r_spotLightSModelShadows 0; r_spotLightEntityShadows 0; "
-              "sm_qualitySpotShadow 0; sm_fullResSpotShadowEnable 0; sm_strictCull 1; sm_sunShadowScale 0.25; "
-              "sm_sunSampleSizeNear 0.25; sm_fastSunShadow 1; sm_sunShadowSmallEnable 1";
-    } else if (shadows == "full") {
-      list += "; sm_enable 1";
+    if (REXCVAR_GET(bo1_fx_lite)) {
+      list += "; fx_cull_effect_spawn 1; fx_cull_elem_spawn 1; fx_cull_elem_draw 1; fx_drawClouds 0; ai_corpseCount 3";
     }
     std::replace(list.begin(), list.end(), '+', ' ');
     std::string out;
@@ -491,18 +734,65 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
     }
     return out;
   }();
-  if (commands.empty()) return;
-  static std::atomic<uint64_t> first_ns{0}, last_ns{0};
+  // Debugging aid: BO1_DEBUG_SHADOW_CYCLE="off,min" switches bo1_shadows to the next preset every 20 s, as the
+  // settings menu would (checks live switching on the Mac, which has no controller menu in scripted runs).
+  static const std::vector<std::string> cycle = [] {
+    std::vector<std::string> out;
+    if (const char* v = std::getenv("BO1_DEBUG_SHADOW_CYCLE")) {
+      std::string list = v;
+      for (size_t start = 0; start < list.size();) {
+        size_t end = list.find(',', start);
+        if (end == std::string::npos) end = list.size();
+        out.push_back(list.substr(start, end - start));
+        start = end + 1;
+      }
+    }
+    return out;
+  }();
+  if (!cycle.empty()) {
+    static uint64_t cycle_ns = 0;
+    static size_t cycle_index = 0;
+    const uint64_t t = NowNs();
+    if (!cycle_ns) cycle_ns = t;
+    if (t - cycle_ns >= 20'000'000'000ull) {
+      cycle_ns = t;
+      REXCVAR_SET(bo1_shadows, cycle[cycle_index++ % cycle.size()]);
+    }
+  }
+  static std::atomic<uint64_t> first_ns{0}, last_ns{0}, shadows_checked_ns{0};
+  // Only this hook's thread reads these two.
+  static std::string shadows = REXCVAR_GET(bo1_shadows);
+  static std::string shadow_commands = ShadowCommands(shadows);
   const uint64_t now = NowNs();
   uint64_t expected = 0;
   first_ns.compare_exchange_strong(expected, now);
   if (now - first_ns.load() < uint64_t(std::max(REXCVAR_GET(bo1_dvars_delay_s), 0)) * 1'000'000'000ull) return;
   uint64_t last = last_ns.load();
+  // The settings menu writes the cvar on the UI thread; the preset names fit std::string's inline buffer, so a read
+  // that races with it can only see a wrong value for a moment.
+  if (last && now - shadows_checked_ns.load() >= 500'000'000ull) {
+    shadows_checked_ns.store(now);
+    const std::string current = REXCVAR_GET(bo1_shadows);
+    REXCVAR_SET(bo1_native_skip_shadow_maps, current == "min");
+    if (current != shadows && ShadowCommands(current) != shadow_commands) {
+      shadows = current;
+      shadow_commands = ShadowCommands(current);
+      if (!shadow_commands.empty()) QueueCommand(ctx, base, shadow_commands);
+      WriteLatchedShadowDvars(base, current);
+      REXLOG_INFO("bo1: shadows set to {} live: {}", current, shadow_commands);
+      return;
+    }
+  }
   if (last && now - last < 5'000'000'000ull) return;
   if (!last_ns.compare_exchange_strong(last, now)) return;
-  if (last && periodic.empty()) return;
-  QueueCommand(ctx, base, last ? periodic : commands);
-  if (!last) REXLOG_INFO("bo1: engine settings queued: {}", commands);
+  std::string batch = last ? periodic : commands;
+  if (!shadow_commands.empty()) batch += (batch.empty() ? "" : "; ") + shadow_commands;
+  if (batch.empty()) return;
+  QueueCommand(ctx, base, batch);
+  if (!last) {
+    REXCVAR_SET(bo1_native_skip_shadow_maps, shadows == "min");
+    REXLOG_INFO("bo1: engine settings queued: {}", batch);
+  }
 }
 
 void MaybeInjectDebugCommand(PPCContext& ctx, uint8_t* base) {

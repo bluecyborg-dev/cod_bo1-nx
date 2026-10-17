@@ -103,6 +103,40 @@ dirties all state; each `vkQueueSubmit` is an IPC (two submits a frame left the 
 - Deferred recording and dynamic blend state changed pixels in lockstep tests although their own checks passed:
   pixel tests, not only self-checks.
 
+## Second pass (2026-10-15 evening): PC ports and two more 360 recompilations
+
+| Port | Approach | What is worth taking |
+|---|---|---|
+| [MarathonRecomp-NX](https://github.com/ChanseyIsTheBest/MarathonRecomp-NX) (Sonic 2006, a heavy 360 game) | XenonRecomp + D3D-level renderer; `docs/SWITCH-OPTIMISATIONS.md` catalogues ~100 changes | **Kernel layer:** guest locks that sleep on the owner word (`svcWaitForAddress`) instead of yielding (a yield never lets a lower-priority owner run on that core); events/semaphores that skip their wake-up call when nobody waits; ~2 µs of spinning before sleeping; the game's job workers and sound thread moved **off core 0** where the game thread runs; a frame limiter that sleeps to the deadline instead of yield-spinning. Measured: CPU-bound spot 47 → 60 FPS over four rounds (game thread 20.2 → 16.1 ms) |
+| [sh2-nx](https://github.com/cutarev/sh2-nx), sh3-nx, sh4-nx (Silent Hill 2/3/4, PC) | x86 lifted; Direct3D 8 on OpenGL 4.3 core | **Screen-sized render targets at fewer lines:** `handheld=480`, `docked=720` (the game keeps its 720p layout, the targets are drawn smaller and scaled). Shader programs prepared ahead (stutter at first draw otherwise). Guest threads on one core by default because a CRI audio bug loops the music otherwise |
+| [outrun2-decomp](https://github.com/r4dius/outrun2-decomp) (OutRun 2006, PC) | decomp | Renders with **deko3d** (Nintendo's native-style API) instead of NVK |
+| dusklight-nx (Twilight Princess) | WebGPU on NVK | Moving to deko3d, expecting "2x+"; nfsmw-nx also has a deko3d renderer in a PR |
+| openPREYswitch (id Tech 4), openmw-nx, GZDoom-NX-2026, AvP Gold | OpenGL / GLES on Mesa | Little performance writing; GL ports are CPU-bound on driver submission (Jak measured 45-67 ms of GL submission per frame) |
+| torchlight-nx (360) | ReXGlue; notes in French | Choosing the interception level: PM4 ring (ours) or the engine's own render system (Ogre's D3D9RenderSystem), where shaders exist as HLSL |
+
+### What the profile of BO1 itself showed (Mac, `sample`, Kino, 2026-10-15)
+
+- The game's **main thread spent ~70 % of its samples inside `NtPulseEvent`**: the SDK implemented a pulse as signal,
+  yield, 10 µs sleep, reset, and BO1's job queue (`sub_82545A00` / `sub_82544D40`) pulses an event for each job it
+  adds. Fixed exactly (`event_pulse_fast`, on): no waiter → reset only; auto-reset event with waiters → one signal the
+  first waiter consumes. After it the main thread waits in a real wait (8,917 of 9,867 samples) and the game runs as
+  before. On the Switch this was likely a large part of the main thread's frame.
+- The render backend thread polls `WaitForSingleObject` with a zero timeout, and each poll yields
+  (`XObject::Wait` → `MaybeYield`). On Horizon a yield only gives way to threads of the same priority. Candidate:
+  short sleeps for repeated zero-timeout polls; measure on the console first.
+- The job workers now spend their time in the game's own job-queue code (`sub_82545308`, `sub_825450A8`): next
+  candidate for a console profile (spinning workers on the main thread's core would cost it time; Marathon moved its
+  workers off core 0).
+
+### Prepared in this pass (2026-10-15)
+
+- `event_pulse_fast` (SDK, on by default).
+- `tools/codegen_post.py` + CMake option `BO1_GUEST_PLAIN_MEMORY` (A1 above): guest memory without volatile, with a
+  compiler barrier at all 13,048 loop headers. Off by default; NRO built in `out/nx-fast`; checked with
+  `tools/find_self_loops.sh` (the default ELF has one self-branch in game code, a genuine halt in `sub_82507548`).
+- `mesa/mesa-switch-p8-direct-draws.patch` (D1 above, merged by hand onto our Mesa patch), opt-in with
+  `P8_DIRECT_DRAWS=1`; not built yet.
+
 ## Proposed order for BO1
 
 1. Console CPU profile in Kino (stack sampler): which thread limits, and its top functions.
@@ -110,3 +144,105 @@ dirties all state; each `vkQueueSubmit` is an IPC (two submits a frame left the 
 3. A1-A3 + A2 as one codegen round (with the loop-barrier and branch-to-self checks), then A6 (LTO, then PGO).
 4. D1 (Mesa patch), D3 (ZCULL), D5/D6 (resolves, depth-only), D10 (960x544) for the GPU side.
 5. C1-C5 on the ring, guided by the profile.
+
+## Third pass (2026-10-16): the console profile, the GTA V toolbox, Mass Effect's recording thread
+
+### What the console stack sampler showed (Kino, shadows off, 20 FPS cap)
+
+The SDK profiler now runs from the command line (`--bo1_profile_stacks=true --bo1_profile_log=true`) and its reports
+come back in the Wi-Fi log. Two lessons about the tool: `open_memstream` froze the game on Horizon (the report is
+written to the SD file and read back instead), and the sampled call chains are not reliable past the first frame
+(the build keeps no frame pointers): use the `pc` distribution and treat `lr` and `stack` lines with care.
+
+- **Job queue spin.** All three cores sat at 300 %. JQ Worker 1/2 (~50-67 % each) re-ran two persistent jobs
+  (callbacks `sub_825BBFD0` / `sub_825BC040`, both "not finished" while `sub_825BBB88()` is non-zero): the worker loop
+  `sub_82545308` puts an unfinished job back on its list (`sub_82546470` from 0x8254551C) and `sub_825450A8` hands it
+  straight out again, ~13,000-16,000 times a second. Throttled (`bo1_job_worker_sleep_us`): workers ~14-20 % each.
+  The helpers' "run one job" (`sub_82545618`, used by Backend's wait loop) then took the spin over: Backend went from
+  ~20-28 % to ~50-77 %. Its requeue (from 0x8254578C) is now throttled too (console test pending).
+- **Renderer thread (`GPU ring native`, ~40-50 % CPU, ~55 % of its samples waiting).** Top functions by `pc`:
+  `XXH3_hashLong` 7.6 %, `memcmp` 7.5 %, `memmove` 7.4 %, `Draw` 7.3 %, `Packet` 5.7 %, `nvk_bind_descriptor_sets`
+  3.3 %, `Type3Packet` 2.6 %, `RangeHash` 2.4 %, NVK cbuf/dynamic-state work ~6 %. Hashing, compare and copy are
+  ~22 % of all its samples (~40 % of its busy time). The callers are not known yet (see the call-chain caveat):
+  candidates are texture change detection (dynamic data stays on full hashes every frame since the flicker fix),
+  vertex range hashing and the upload copies. Next step: per-site byte counters (cheap, exact) instead of sampling.
+
+### GTA V Switch toolbox (niceboat0/GTA5-Switch-Toolbox, read 2026-10-16)
+
+A mod / settings manager for the GTA V homebrew port (the port's own source is not public). The GTA V port uses the
+PC game's `settings.xml` (DX_Version, MSAA, shadow and reflection quality), so it is a PC-build port, not a 360
+recompilation. What its tuning presets record (from the header comments, translated):
+
+- Shrinking memory / model-info pools makes it **more** stuttery (full pools force constant unload and reload). Same
+  lesson as our texture streaming: cut the work, not the budget.
+- What saves CPU: entity density multipliers, entity count limits, population update rates and cull ranges.
+  Population density measured as the single biggest knob (~11 % between 0 and 10 of 10).
+- BO1's equivalents, present as dvars in the game image: `ai_corpseCount`, `cg_bloodLimit`, `fx_cull_elem_draw`,
+  `fx_cull_elem_spawn`, `fx_cull_effect_spawn`, `fx_marks`, `dynEnt_spawnedLimit`, `ragdoll_max_simulating`,
+  `r_lodScaleRigid` / `r_lodScaleSkinned`, `r_lodBiasRigid` / `r_lodBiasSkinned`, `r_zfar`. Candidates for the hounds
+  round (effects-heavy); defaults still to read from the dvar registration.
+
+### Mass Effect's deferred recording (refs/masseffect-nx/docs/nvk-per-draw.md)
+
+With deferred recording on, every `vkCmd*` on their ring thread only queues the call; a worker (0x2C, core 0) replays
+the queue into NVK. NVK's own cost was ~4-5.5 µs per recorded draw (draw + state flush 1.8-2.8, pipeline bind
+0.75-1.4, descriptor sets 0.95-1.5); the ring's remaining per-draw work was the renderer's own (~16-25 µs per recorded
+draw before their later cuts). Our equivalent, `bo1_native_record_thread`, replays the same draw commands in the same
+order (anything else recording drains it first), so the "not pixel-identical" problem of Futari/SA2's approach should
+not apply. It was off because the three cores were saturated; with the job queue spin gone there is a core to give
+it. Candidate for a console A/B.
+
+### Proposed order (updated)
+
+1. Console test of the open builds: prepass skip + helper requeue throttle (built 2026-10-16).
+2. Per-site byte/time counters for hashing, compares and copies on the renderer thread; cut the largest.
+3. `bo1_native_record_thread` A/B now that a core is free.
+4. Hounds round: effect / corpse / LOD dvars (later, as the user asked).
+5. 960x544, ZCULL, then the codegen round (direct calls, FPCR moves, LTO/PGO).
+
+## Fourth pass (2026-10-16): review of the ChatGPT deep-research report
+
+`docs/black_ops_switch_performance_research.md` (ChatGPT, from the prompt in this session). It marks estimates as
+estimates and invents no benchmarks, but most of it is general method. Checked against our measurements:
+
+- **Instrument the per-draw path by stage** (its #1): agreed, the most useful item. The profiler's pc/lr pairs are
+  the first step; next a per-stage stopwatch on the renderer thread (Mass Effect's `C6 stages` is the model).
+- **Dirty-state tracking / skip redundant binds and constant writes** (#2): largely in place (setup cache, bound
+  viewport/scissor/blend/bias checks, NVK's "CB0 only when changed" is in our Mesa pin). Add counters of requested
+  versus emitted state changes to confirm.
+- **Suppress the shadow system's extra draw lists upstream** (#3): right diagnosis (with `sm_enable 1` the game
+  issues ~2x draws that are not shadow maps), but it only matters for the `min` preset; the user plays with shadows
+  off. Low priority.
+- **Dynamic resolution at 960x544 → 640x360** (#4): the premise is wrong (we render 1040x608; 960x544 was a plan
+  item), and in a PM4 translator the game's EDRAM-sized targets make dynamic resolution a large job. The cheap GPU
+  levers now are `bo1_native_msaa=false` and `bo1_native_zcull=true`.
+- **One vs two frames in flight; modest priority/affinity changes** (#5): worth one test for the input lag felt with
+  shadows on. The SDK already manages priorities; the busy-wait fixes came from this kind of measurement.
+- **VK_EXT_multi_draw, instancing, reused command buffers**: low value until a capture shows long runs of
+  state-identical consecutive draws (few in BO1's stream so far).
+- **deko3d**: same conclusion as before (benchmark before any rewrite).
+- Corrections: "Mesa 26.1 disables large pages" is about NVK GPU pages, not the SDK's CPU-side
+  `guest_memory_large_pages`. Two of its links (a "techoverflow" multi-draw article and a personal `Xenon-Recomp`
+  repository) could not be verified as primary sources.
+
+Added to the checklist from it: per-stage renderer stopwatch, requested-vs-emitted state counters, frames-in-flight test.
+
+`docs/deep-research-report.md` is a shorter, earlier draft of the same research. Nothing new, and several claims are
+wrong for this port: multi-draw "cutting draw overhead 50-75 %" assumes the cost is the Vulkan call (our profile puts
+most of it in our own translation work); "update to Mesa 26.x" (already 26.2.3); "800x450 halves the pixels" (31 %
+fewer) at an assumed 960x544 (we render 1040x608); "render thread above 0x3B, real-time" misreads Horizon priorities
+(lower number = higher; ours is 0x2C); deko3d "avoids validation layers" (none are active). Only the "turn off costly
+effects through dvars" point stands, already on the checklist (hounds round, later).
+
+`docs/deep-research-report-2.md` (ChatGPT, dvar documentation for T5). The defaults we could check against the game's
+own registration (`sub_8258CDA8`) match: `sm_maxLights` 4, `r_spotLightEntityShadows` / `r_spotLightSModelShadows` 1,
+`sm_sunShadowSmallEnable` 0, `sm_strictCull` 1, `sm_fastSunShadow` 1. Its answer to "why ~2x draws with sm_enable 1"
+(extra lighting passes per light) is inferred and **does not match a Mac measurement** (Kino, 2026-10-16, prepass not
+skipped): with `min` the game issues ~905k draws per 10 s against ~326k with `off`, and ~580k of them are shadow-map
+draws that `min` skips (reason 15), so the draws rendered are about the same (~310k vs ~326k). The extra cost of the
+shadow system is the game building, and the renderer parsing, shadow-map caster draws that are thrown away. Its levers
+for that (fewer shadowed lights, no entity/static-model casters, small sun map) are what `min` already sets;
+`sm_sunEnable`, `sm_spotEnable` and `r_spotLightShadows` are documented but did nothing in this build's frame trace.
+Useful for the hounds round: `fx_cull_effect_spawn` (default 0 → 1), `fx_drawClouds`, `r_glow`.
+New lead: shrink the sun shadow range further for `min` (`sm_sunShadowScale` < 0.25, `sm_sunSampleSizeNear` < 0.25) so
+the game stops generating the caster draws `min` discards.

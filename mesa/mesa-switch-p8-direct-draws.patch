@@ -1,0 +1,251 @@
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 45eb338c32e..0703eb42b1e 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -660,6 +660,9 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+                        const VkCommandBuffer *pCommandBuffers)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    if (commandBufferCount == 0)
+       return;
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index a82252bea24..5271d9223fe 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -241,6 +241,16 @@ struct nvk_graphics_state {
+    /* Used for meta save/restore */
+    VkDeviceAddressRangeKHR vb0;
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++   /* Before Turing the draw macro writes the draw parameters (base vertex,
++    * base instance, draw and view index) into cb0 unconditionally, four
++    * constant buffer updates per draw. True when this command buffer's last
++    * draw left all of them zero, so a draw with zero parameters can skip the
++    * macro and its cb0 writes.
++    */
++   bool switch_draw_params_zero;
++#endif
++
+    /* Needed by vk_command_buffer::dynamic_graphics_state */
+    struct vk_vertex_input_state _dynamic_vi;
+    struct vk_sample_locations_state _dynamic_sl;
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index c7cd0a5489d..5e15109d573 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -979,6 +979,10 @@ void
+ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+                               const VkCommandBufferBeginInfo *pBeginInfo)
+ {
++#ifdef HAVE_SWITCH_PLATFORM
++   /* Whatever an earlier command buffer left in cb0 is unknown here. */
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+    const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 9);
+@@ -5707,6 +5711,36 @@ nvk_mme_build_draw(struct mme_builder *b,
+       nvk_mme_unspill(b, DRAW_IDX, draw_index);
+ }
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++/* A draw that can be issued without the draw macro: the parameters it would
++ * write are all zero and already are, and there is no multiview loop.  The
++ * nouveau GL driver issues direct draws on these GPUs the same way.
++ */
++static bool
++nvk_switch_direct_draw_ok(struct nvk_cmd_buffer *cmd, uint32_t instance_count,
++                          int32_t first_vertex_or_offset, uint32_t first_instance)
++{
++   return nvk_cmd_buffer_3d_cls(cmd) < PASCAL_B &&
++          instance_count == 1 && first_vertex_or_offset == 0 &&
++          first_instance == 0 &&
++          cmd->state.gfx.render.view_mask == 0 &&
++          cmd->state.gfx.switch_draw_params_zero;
++}
++
++static uint32_t
++nvk_switch_direct_begin(void)
++{
++   uint32_t begin;
++   V_NVC197_BEGIN(begin, {
++      .primitive_id = PRIMITIVE_ID_FIRST,
++      .instance_id = INSTANCE_ID_FIRST,
++      .split_mode = SPLIT_MODE_NORMAL_BEGIN_NORMAL_END,
++      .instance_iterate_enable = false,
++   });
++   return begin;
++}
++#endif
++
+ void
+ nvk_mme_draw(struct mme_builder *b)
+ {
+@@ -5732,6 +5766,22 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+    nvk_cmd_flush_gfx_state(cmd);
+ 
+ #ifdef HAVE_SWITCH_PLATFORM
++   /* bo1-nx: project8-sw's direct draw (the-simpsons-game-nx patch 0003, MIT): no draw macro when the parameters it
++    * would write into cb0 are all zero and already are. */
++   if (nvk_switch_direct_draw_ok(cmd, instanceCount, firstVertex, firstInstance)) {
++      const uint64_t t_direct_sw = nvk_sw_t0(cmd);
++      struct nv_push *pd = nvk_cmd_buffer_push(cmd, 7);
++      P_MTHD(pd, NV9097, BEGIN);
++      P_INLINE_DATA(pd, nvk_switch_direct_begin());
++      P_MTHD(pd, NV9097, SET_VERTEX_ARRAY_START);
++      P_NV9097_SET_VERTEX_ARRAY_START(pd, 0);
++      P_NV9097_DRAW_VERTEX_ARRAY(pd, vertexCount);
++      P_MTHD(pd, NV9097, END);
++      P_INLINE_DATA(pd, 0);
++      nvk_sw_part(cmd, NVK_SW_P_EMIT, t_direct_sw);
++      nvk_sw_finish_draw(cmd, t_draw_sw);
++      return;
++   }
+    const uint64_t t_emit_sw = nvk_sw_t0(cmd);
+ #endif
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+@@ -5760,6 +5810,8 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+ #endif
+    }
+ #ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero =
++      firstVertex == 0 && firstInstance == 0 && cmd->state.gfx.render.view_mask == 0;
+    cmd->state.sw.emission_mode = nvk_sw_emission_mode(cmd);
+    nvk_sw_part(cmd, NVK_SW_P_EMIT, t_emit_sw);
+    nvk_sw_finish_draw(cmd, t_draw_sw);
+@@ -5775,6 +5827,9 @@ nvk_CmdDrawMultiEXT(VkCommandBuffer commandBuffer,
+                     uint32_t stride)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    if (unlikely(!drawCount || !pVertexInfo->vertexCount || !instanceCount))
+       return;
+@@ -5939,6 +5994,21 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+    nvk_cmd_flush_gfx_state(cmd);
+ 
+ #ifdef HAVE_SWITCH_PLATFORM
++   /* bo1-nx: project8-sw's direct draw (see nvk_CmdDraw). */
++   if (nvk_switch_direct_draw_ok(cmd, instanceCount, vertexOffset, firstInstance)) {
++      const uint64_t t_direct_sw = nvk_sw_t0(cmd);
++      struct nv_push *pd = nvk_cmd_buffer_push(cmd, 7);
++      P_MTHD(pd, NV9097, BEGIN);
++      P_INLINE_DATA(pd, nvk_switch_direct_begin());
++      P_MTHD(pd, NV9097, SET_INDEX_BUFFER_F);
++      P_NV9097_SET_INDEX_BUFFER_F(pd, firstIndex);
++      P_NV9097_DRAW_INDEX_BUFFER(pd, indexCount);
++      P_MTHD(pd, NV9097, END);
++      P_INLINE_DATA(pd, 0);
++      nvk_sw_part(cmd, NVK_SW_P_EMIT, t_direct_sw);
++      nvk_sw_finish_draw(cmd, t_draw_sw);
++      return;
++   }
+    const uint64_t t_emit_sw = nvk_sw_t0(cmd);
+ #endif
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
+@@ -5971,6 +6041,8 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+ #endif
+    }
+ #ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero =
++      vertexOffset == 0 && firstInstance == 0 && cmd->state.gfx.render.view_mask == 0;
+    cmd->state.sw.emission_mode = nvk_sw_emission_mode(cmd);
+    nvk_sw_part(cmd, NVK_SW_P_EMIT, t_emit_sw);
+    nvk_sw_finish_draw(cmd, t_draw_sw);
+@@ -5987,6 +6059,9 @@ nvk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer,
+                            const int32_t *pVertexOffset)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    if (unlikely(!drawCount || !pIndexInfo->indexCount || !instanceCount))
+       return;
+@@ -6054,6 +6129,9 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+                         const VkDrawIndirect2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+    uint64_t stride = pInfo->addressRange.stride;
+ 
+    if (unlikely(!pInfo->drawCount))
+@@ -6168,6 +6246,9 @@ nvk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
+                                const VkDrawIndirect2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+    uint64_t stride = pInfo->addressRange.stride;
+ 
+    /* From the Vulkan 1.3.238 spec:
+@@ -6272,6 +6353,9 @@ nvk_CmdDrawIndirectCount2KHR(VkCommandBuffer commandBuffer,
+                              const VkDrawIndirectCount2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    /* TODO: Indirect count draw pre-Turing */
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+@@ -6327,6 +6411,9 @@ nvk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
+                                     const VkDrawIndirectCount2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    /* TODO: Indexed indirect count draw pre-Turing */
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+@@ -6439,6 +6526,9 @@ nvk_CmdDrawIndirectByteCount2EXT(VkCommandBuffer commandBuffer,
+                                  uint32_t vertexStride)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    if (unlikely(!instanceCount))
+       return;
+diff --git a/src/util/os_misc.c b/src/util/os_misc.c
+index 4eb0fd98843..87d79ab39da 100644
+--- a/src/util/os_misc.c
++++ b/src/util/os_misc.c
+@@ -483,6 +483,17 @@ os_get_available_system_memory(uint64_t *size)
+    const uintptr_t heap_end = (uintptr_t)fake_heap_end;
+ 
+    if (heap_start && heap_end > heap_start) {
++      /* mallinfo walks the whole newlib heap under its lock, and VMA asks for
++       * the budget every few dozen allocations: in a game creating textures
++       * as it streams, that was several percent of the thread recording draws.
++       * A value up to 100 ms old is as good for a budget.
++       */
++      static uint64_t cached_size, cached_tick;
++      const uint64_t now = armGetSystemTick();
++      if (cached_tick && now - cached_tick < armGetSystemTickFreq() / 10) {
++         *size = cached_size;
++         return true;
++      }
+       const uint64_t heap_size = heap_end - heap_start;
+       const struct mallinfo allocator = mallinfo();
+       const uint64_t arena = MIN2((uint64_t)allocator.arena, heap_size);
+@@ -494,6 +505,8 @@ os_get_available_system_memory(uint64_t *size)
+        * Counting both also makes the value recover when BO storage is freed.
+        */
+       *size = heap_size - arena + reusable;
++      cached_size = *size;
++      cached_tick = now;
+       return true;
+    }
+ 

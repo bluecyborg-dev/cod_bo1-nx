@@ -4,7 +4,9 @@
 #
 #     <OUT>/opt/devkitpro/portlibs/switch/lib/libvulkan.a
 #
-# Steps: clone danfromtico/mesa-switch at the pinned commit, apply mesa-switch-masseffect.patch, run the upstream
+# Steps: clone danfromtico/mesa-switch at the pinned commit, apply mesa-switch-masseffect.patch and
+# mesa-switch-p8-direct-draws.patch (P8_DIRECT_DRAWS=0 leaves it out: draws without the draw macro when their parameters are zero,
+# and the memory query cached; project8-sw's patch 0003 as the-simpsons-game-nx ships it, MIT, merged by hand), run the upstream
 # build-switch.sh (it builds the devkitpro-mesa-rust image from Docker.rust, then Mesa's host tools, then the Switch
 # archives), and merge libnak_rs.a (the Rust runtime of the shader compiler) into libvulkan.a.
 #
@@ -37,6 +39,8 @@ MESA_OPT=${MESA_OPT:-2}
 MESA_OPT=${MESA_OPT#[Oo]}
 case "$MESA_OPT" in 1|2|3) ;; *) echo "error: MESA_OPT must be 1, 2 or 3 (got '$MESA_OPT')" >&2; exit 1 ;; esac
 INCREMENTAL=0
+PATCHES=("$PATCH")
+[ "${P8_DIRECT_DRAWS:-1}" = 1 ] && PATCHES+=("$HERE/mesa-switch-p8-direct-draws.patch")
 [ "${1:-}" = "--incremental" ] && INCREMENTAL=1
 
 mkdir -p "$(dirname "$SRC")" "$OUT"
@@ -49,12 +53,27 @@ if [ "$INCREMENTAL" = 0 ]; then
     git clone --no-checkout "$UPSTREAM" "$SRC"
   fi
   cd "$SRC"
-  if git apply --reverse --check "$PATCH" 2>/dev/null; then
-    echo "== patch already applied"
+  # The patches, in order. A stamp file holds their hash: when they change, the tree goes back to the pinned commit
+  # (tracked files, and the files the patches create) and all are applied again. Build directories stay.
+  # PATCHES (set above): mesa-switch-p8-direct-draws.patch is on by default since the console test of 2026-10-16
+  # (renderer CPU per draw roughly halved with shadows on); P8_DIRECT_DRAWS=0 builds without it.
+  STAMP="$SRC/.bo1-patches"
+  WANT=$(cat "${PATCHES[@]}" | shasum | cut -d' ' -f1)
+  if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$WANT" ]; then
+    echo "== patches already applied"
   else
-    git checkout -q "$PIN"
-    echo "== apply $(basename "$PATCH")"
-    git apply "$PATCH"
+    git checkout -q -f "$PIN"
+    for patch in "${PATCHES[@]}"; do
+      # Files the patch creates (--- /dev/null): left over from an earlier apply, they would make it fail.
+      awk '/^--- \/dev\/null/{getline; sub(/^\+\+\+ b\//, ""); print}' "$patch" | while read -r created; do
+        rm -f "$created"
+      done
+    done
+    for patch in "${PATCHES[@]}"; do
+      echo "== apply $(basename "$patch")"
+      git apply "$patch"
+    done
+    echo "$WANT" > "$STAMP"
   fi
   [ "${APPLY_ONLY:-0}" = 1 ] && { echo "patched source: $SRC"; exit 0; }
   # build-switch.sh is upstream's file (not part of the patch): set the optimization level of the cross build there.
@@ -93,7 +112,7 @@ docker run --rm -v "$SRC:/project" -w "/project/$BD" "$IMAGE" bash -c "
   printf 'CREATE /project/$BD/libvulkan_merged.a\nADDLIB src/nouveau/vulkan/libvulkan.a\nADDLIB src/nouveau/compiler/libnak_rs.a\nSAVE\nEND\n' | \$AR -M"
 mv "$SRC/$BD/libvulkan_merged.a" "$LIBDIR/libvulkan.a"
 cat > "$OUT/SOURCE.txt" <<EOT
-mesa-switch $PIN + masseffect-nx mesa/mesa-switch-masseffect.patch
+mesa-switch $PIN, patches: ${PATCHES[*]##*/}
 built with build-switch.sh (Docker), -Doptimization=$MESA_OPT ($BD), libvulkan.a = $BD libvulkan.a + libnak_rs.a merged with ar -M
 EOT
 ls -la "$LIBDIR/libvulkan.a"

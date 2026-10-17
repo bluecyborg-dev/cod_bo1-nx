@@ -285,6 +285,16 @@ top bits 01, index/format/count as floats in [2^23, 2^24)) and do the copy on th
 
 ---
 
+## 6b. Kernel waits: profile them even on the PC
+
+- A thread profile on the PC/Mac (`sample` on macOS) shows host-side waits that the console pays more for. BO1's
+  main thread spent ~70 % of its samples in `NtPulseEvent`: the SDK implemented a pulse as signal + yield + 10 µs
+  sleep + reset, and the game's job queue pulses an event per job. A pulse with nobody waiting only resets the event;
+  an auto-reset event with waiters needs one signal (the first waiter consumes it). Neither needs the sleep.
+- Zero-timeout polls of `WaitForSingleObject` that yield on every timeout are a spin in disguise; on Horizon a yield
+  only gives way to threads of the same priority (MarathonRecomp-NX: sleeping guest locks, events without wake-up
+  calls when nobody waits, job workers off the game thread's core).
+
 ## 7. What did not work (here or in the other ports)
 
 - Turning a game system off with a dvar can leave its shaders reading stale data: BO1 with `sm_enable 0` lit models
@@ -307,6 +317,9 @@ top bits 01, index/format/count as floats in [2^23, 2^24)) and do the copy on th
 | Creating more textures synchronously without a memory pool (BO1) | 8 ms per texture on the ring |
 | Turning texture streaming off before a load / through the command buffer (BO1) | the load froze |
 | Predecessor stand-ins keyed by the mips address (BO1) | never matched: the streamer moves the mips too |
+| `open_memstream` (newlib) for the profiler's report text (BO1) | froze the game the first time it ran, every boot; a plain `fopen` file + read back works |
+| Network log sink calling `send(..., MSG_DONTWAIT)` from the logging thread, inside the sink mutex (BO1) | a Wi-Fi or receiver stall still blocked `send()` for seconds and every thread that logs (the ring, audio) waited on the mutex: 1.7-4.4 s whole-game freezes; queue the lines and send from a thread of their own |
+| Skipping only the shadow map draws to make shadows cheap (BO1) | with the shadow system on the game also draws ~2x the scene draws; the maps were the smaller part |
 
 ---
 
@@ -340,4 +353,4 @@ top bits 01, index/format/count as floats in [2^23, 2^24)) and do the copy on th
 - sa2-nx `docs/porting-guide.md`, `enhancements.md`, `gpu-optimisation-candidates.md`; futari-nx `xbox360.md` (five
   ports' shared notebook); UnleashedRecomp-NX `docs/SWITCH-PERFORMANCE.md`; the-simpsons-game-nx Mesa patches.
   Summarised and ranked for this port in `docs/OTHER_PORTS_RESEARCH.md`.
-- This repository: `PORTING_RESEARCH.md` (§8b-8d), `OPTIMIZATION_PLAN.md`, `app/src/native/`, `app/src/bo1_engine.cpp`.
+- This repository: `PORTING_RESEARCH.md` (§8b-8d), `OPTIMIZATION_PLAN.md` (checklist), `docs/OPTIMIZATION_LOG.md` (results), `app/src/native/`, `app/src/bo1_engine.cpp`.

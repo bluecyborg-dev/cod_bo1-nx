@@ -10,10 +10,14 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
+#include <condition_variable>
 #include <filesystem>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -37,6 +41,7 @@
 #include <unistd.h>
 #include <switch.h>
 #include <spdlog/sinks/base_sink.h>
+extern "C" void RexSwitchPerfSetThreadName(u32 handle, const char* name);
 #endif
 
 #if REX_PLATFORM_WIN32
@@ -202,25 +207,89 @@ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_di
 }
 
 #ifdef __SWITCH__
-// log_network: one TCP connection to a listener on the development machine. Never blocks the game: lines are
-// sent with MSG_DONTWAIT and dropped when the socket is full; after an error the sink goes quiet.
+// log_network: one TCP connection to a listener on the development machine. Never blocks the game: the threads that
+// log only copy the line into a memory queue (up to kMaxPending bytes; past that lines are dropped and counted) and
+// a sender thread of its own does the send() calls. The first version sent from the logging thread with
+// MSG_DONTWAIT, inside the sink's mutex: on the console (2026-10-16) a send() still sat for seconds during a Wi-Fi or
+// receiver stall, and every thread that logged (the ring, audio, the job workers) waited on that mutex: 1.7-4.4 s
+// freezes of the whole game. After a send error the sink goes quiet. The sender is a libnx thread like
+// log_nonblocking's writer: a std::thread created here crashed the game at startup (2026-10-16). If it cannot be
+// started, the sink stays quiet.
 class TcpLogSink : public spdlog::sinks::base_sink<std::mutex> {
  public:
-  explicit TcpLogSink(int fd) : fd_(fd) {}
+  explicit TcpLogSink(int fd) : fd_(fd) {
+    // Mostly blocked in the socket IPC; 0x2C as the log writer (below audio 0x2B, above the guest threads 0x3B).
+    if (R_FAILED(threadCreate(&thread_, &TcpLogSink::ThreadEntry, this, nullptr, 64 * 1024, 0x2C, -2))) {
+      dead_.store(true, std::memory_order_relaxed);
+      return;
+    }
+    RexSwitchPerfSetThreadName(thread_.handle, "log network");
+    if (R_FAILED(threadStart(&thread_))) {
+      threadClose(&thread_);
+      dead_.store(true, std::memory_order_relaxed);
+    }
+  }
 
  protected:
   void sink_it_(const spdlog::details::log_msg& msg) override {
-    if (fd_ < 0) return;
+    if (dead_.load(std::memory_order_relaxed)) return;
     spdlog::memory_buf_t text;
     formatter_->format(msg, text);
-    if (send(fd_, text.data(), text.size(), MSG_DONTWAIT) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-      fd_ = -1;
+    {
+      std::lock_guard lock(queue_mutex_);
+      if (pending_.size() + text.size() > kMaxPending) {
+        ++dropped_;
+        return;
+      }
+      pending_.append(text.data(), text.size());
     }
+    queue_cv_.notify_one();
   }
   void flush_() override {}
 
  private:
-  int fd_;
+  static constexpr size_t kMaxPending = 4 << 20;
+
+  static void ThreadEntry(void* arg) { static_cast<TcpLogSink*>(arg)->SendLoop(); }
+
+  void SendLoop() {
+    std::string batch;
+    while (true) {
+      uint64_t dropped = 0;
+      {
+        std::unique_lock lock(queue_mutex_);
+        queue_cv_.wait(lock, [this] { return !pending_.empty(); });
+        batch.swap(pending_);
+        pending_.clear();
+        dropped = dropped_;
+        dropped_ = 0;
+      }
+      if (dropped) {
+        batch.insert(0, fmt::format("[log_network] {} lines dropped: the send queue was full\n", dropped));
+      }
+      size_t off = 0;
+      while (off < batch.size()) {
+        const ssize_t n = send(fd_, batch.data() + off, batch.size() - off, 0);
+        if (n > 0) {
+          off += size_t(n);
+        } else if (n < 0 && errno == EINTR) {
+          continue;
+        } else {
+          dead_.store(true, std::memory_order_relaxed);
+          return;
+        }
+      }
+      batch.clear();
+    }
+  }
+
+  const int fd_;
+  Thread thread_{};
+  std::atomic<bool> dead_{false};
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::string pending_;
+  uint64_t dropped_ = 0;
 };
 
 int ConnectLogNetwork(const std::string& target) {

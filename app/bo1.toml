@@ -17,6 +17,9 @@ bo1_renderer = "native"
 # 2 = 30 FPS (the game cannot hold it yet), 1 = no cap (higher average, uneven frame times).
 bo1_min_frame_vblanks = 3
 
+# Hold each frame for the cap before presenting it (true) rather than after: frames reach the screen evenly spaced.
+bo1_pace_before_present = true
+
 # ----------------------------------------------------------------------------
 #  Engine settings (the game's own dvars), applied after start-up
 # ----------------------------------------------------------------------------
@@ -25,8 +28,9 @@ bo1_min_frame_vblanks = 3
 # bo1_dvars = "r_dof_enable 0; r_distortion 0; r_flameFX_enable 0; cg_brass 0; fx_marks_smodels 0; ragdoll_enable 0"
 
 # Dynamic shadows (baked shadows always stay). "off" is fastest, but the hands and characters flicker between lit and
-# dark when moving near lights; "lite" keeps one spot light and a short sun shadow range, world casters only, at low
-# quality; "full" is the game's own (much slower).
+# dark when moving near lights; "min" keeps the game's shadow system on (no flicker) but draws no shadow map, so there
+# are no dynamic shadows (~15 % slower than off). Changes live in game: hold - (minus) and press D-pad Right/Left, or
+# the settings menu (L+R+Right).
 # bo1_shadows = "off"
 
 # High-detail texture streaming off during gameplay (back on for loading screens). Removes most stutter; textures are

@@ -35,6 +35,15 @@ mkdir -p "$ROOT/out/net_logs"
 LOG="$ROOT/out/net_logs/$(date +%Y%m%d-%H%M%S).log"
 ln -sfn "$(basename "$LOG")" "$ROOT/out/net_logs/latest.log"
 
+# A listener left over from an earlier run (its game connection half-closed) still answers on the port: the next game
+# connected to it, nobody read, and the game blocked on its own stdout at a black screen (2026-10-16). Stop it first.
+stale=$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+if [[ -n "$stale" ]]; then
+  echo "== stopping an old log listener on port $PORT (pid $stale)"
+  kill $stale 2>/dev/null || true
+  sleep 0.5
+fi
+
 # Listener first: the game connects to it while it starts its logging.
 nc -l "$PORT" > "$LOG" &
 NC_PID=$!

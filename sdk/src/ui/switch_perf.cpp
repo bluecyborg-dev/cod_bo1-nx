@@ -144,6 +144,41 @@ std::string ReportPath() {
   return std::string(RexSwitchLogDir()) + "rex_profile.log";
 }
 
+/*
+ * Optional hooks the executable may define (bo1-nx). RexSwitchPerfStacksWanted turns stack sampling on without the
+ * flag file on the SD card; RexSwitchPerfReportText receives the text of every report, to send it over the network
+ * log. The report is written to rex_profile.log as before; when the hook exists, the part just appended is read back
+ * from the file and handed to it.
+ */
+extern "C" __attribute__((weak)) bool RexSwitchPerfStacksWanted(void);
+extern "C" __attribute__((weak)) void RexSwitchPerfReportText(const char* text, size_t len);
+
+// Where the report about to be written starts in rex_profile.log (0 when the file is rewritten).
+long ReportStart(FILE* f) {
+  if (!RexSwitchPerfReportText) return 0;
+  std::fseek(f, 0, SEEK_END);
+  return std::ftell(f);
+}
+
+// Closes the report and hands what was appended since `start` to the hook.
+void FinishReport(FILE* f, long start) {
+  std::fclose(f);
+  if (!RexSwitchPerfReportText || start < 0) return;
+  FILE* in = std::fopen(ReportPath().c_str(), "rb");
+  if (!in) return;
+  std::fseek(in, 0, SEEK_END);
+  const long end = std::ftell(in);
+  if (end > start && end - start <= (256 << 10)) {
+    std::string text(size_t(end - start), '\0');
+    std::fseek(in, start, SEEK_SET);
+    text.resize(std::fread(text.data(), 1, text.size(), in));
+    std::fclose(in);
+    RexSwitchPerfReportText(text.data(), text.size());
+    return;
+  }
+  std::fclose(in);
+}
+
 struct Slot {
   std::atomic<u32> handle{0};
   char name[32]{};
@@ -562,6 +597,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
     g_sample_count = 0;
     return;
   }
+  const long report_start = ReportStart(f);
 
   ApplyExclusiveCore(f, order);
 
@@ -901,6 +937,24 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
       PrintAddr(f, lr_hist[k].addr);
       std::fputc('\n', f);
     }
+    // bo1-nx: pc and lr of the same sample, both as image offsets ("pair image+0xPC <- image+0xLR"). In a leaf function
+    // (memcpy, memcmp, a hash loop) lr is its caller, which the separate lists above cannot tell; the x29 chains below
+    // are not reliable in a build without frame pointers. Grouped by function on the host (addr2line).
+    if (active) {
+      std::vector<u64> pairs;
+      pairs.reserve(pcs.size());
+      for (size_t k = 0; k < pcs.size(); ++k) {
+        if (!InText(pcs[k])) continue;
+        const u64 lr_off = InText(lrs[k]) ? (lrs[k] - g_base) : 0xFFFFFFFFull;
+        pairs.push_back(((pcs[k] - g_base) << 32) | (lr_off & 0xFFFFFFFFull));
+      }
+      const auto pair_hist = Histogram(pairs);
+      for (size_t k = 0; k < pair_hist.size() && k < 60u; ++k) {
+        std::fprintf(f, "   %5.1f%%  pair image+0x%" PRIx64 " <- image+0x%" PRIx64 "\n",
+                     double(pair_hist[k].n) * 100.0 / double(busy), pair_hist[k].addr >> 32,
+                     pair_hist[k].addr & 0xFFFFFFFFull);
+      }
+    }
 
     // Full stacks, waits included: they say what the thread is waiting for.
     std::vector<const Sample*> by_stack;
@@ -967,7 +1021,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
     }
   }
   std::fputc('\n', f);
-  std::fclose(f);
+  FinishReport(f, report_start);
 }
 
 /*
@@ -1066,6 +1120,9 @@ void ProfilerMain(void*) {
     sample_stacks = true;
     std::fclose(flag);
   }
+  if (RexSwitchPerfStacksWanted && RexSwitchPerfStacksWanted()) {
+    sample_stacks = true;
+  }
 
   u64 counters_last[kCounterCount]{};
   for (unsigned i = 0; i < kCounterCount; ++i) {
@@ -1075,7 +1132,7 @@ void ProfilerMain(void*) {
     std::fprintf(f, "image 0x%016" PRIx64 ", code up to 0x%016" PRIx64 "\n\n", g_base,
                  g_text_hi);
     std::fprintf(f, "Stack sampling: %s\n", sample_stacks ? "active (1 ms)" : "disabled");
-    std::fclose(f);
+    FinishReport(f, 0);
   }
 
   // The console overlays read from SaltyNX's shared memory. That is already running from second

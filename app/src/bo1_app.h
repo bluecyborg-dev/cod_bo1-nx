@@ -29,6 +29,11 @@
 
 REXCVAR_DECLARE(std::string, bo1_debug_hash_files);
 
+// bo1_engine.cpp: MINUS + D-pad Right/Left cycles the shadow presets on the Switch.
+void Bo1RegisterShadowCombo();
+// bo1_engine.cpp: sends the console profiler's reports to the log (bo1_profile_log).
+void Bo1StartProfileLog();
+
 class Bo1App : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -39,6 +44,8 @@ class Bo1App : public rex::ReXApp {
 
  protected:
   void OnPostInitLogging() override {
+    Bo1RegisterShadowCombo();
+    Bo1StartProfileLog();
     // The runtime defaults to no GPU plugin: select ReXGlue's Xenos emulation, keeping an explicit choice made
     // in bo1.toml.
     if (!rex::cvar::HasNonDefaultValue("gpu_plugin")) {

@@ -19,6 +19,11 @@
 
 namespace rex::input::nx {
 
+// bo1-nx: the app's handler for "hold MINUS, press D-pad Right/Left" (direction +1/-1), called on the thread that
+// polls the pads. While MINUS is held and a handler is set, the game does not see the D-pad.
+using MinusDpadHandler = void (*)(int direction);
+void SetMinusDpadHandler(MinusDpadHandler handler);
+
 // Polls the pads directly from HID shared memory on the calling guest thread.
 // Unlike the SDL driver it needs no window and no UI-thread event pump.
 //

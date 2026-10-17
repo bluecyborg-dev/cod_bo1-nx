@@ -68,6 +68,15 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     endif()
 endif()
 
+# Guest memory accessed without volatile (tools/codegen_post.py routes the accesses through REX_GUEST_MEM and puts a
+# compiler barrier at every loop header so polling loops keep reading memory). On by default since the console test
+# of 2026-10-16 (smoother play, no hang); masseffect-nx measured +15-20 % on the game threads. Check every ELF with
+# tools/find_self_loops.sh.
+option(BO1_GUEST_PLAIN_MEMORY "Generated code accesses guest memory without volatile" ON)
+if(BO1_GUEST_PLAIN_MEMORY AND TARGET bo1_recomp)
+    target_compile_definitions(bo1_recomp PRIVATE "REX_GUEST_MEM=")
+endif()
+
 if(REXGLUE_PLATFORM_SWITCH)
     # On the SD card: sdmc:/switch/bo1-nx/bo1-nx.nro with bo1.toml and game_root/ beside it.
     set(BO1_VERSION "0.0.1" CACHE STRING "NRO display version")

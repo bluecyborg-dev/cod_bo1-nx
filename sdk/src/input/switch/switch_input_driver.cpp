@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -286,6 +287,14 @@ struct SwitchInputDriver::Slot {
   uint16_t vibration_left = 0;
   uint16_t vibration_right = 0;
 };
+
+namespace {
+std::atomic<MinusDpadHandler> g_minus_dpad_handler{nullptr};
+}  // namespace
+
+void SetMinusDpadHandler(MinusDpadHandler handler) {
+  g_minus_dpad_handler.store(handler, std::memory_order_release);
+}
 
 SwitchInputDriver::SwitchInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order) {}
@@ -737,6 +746,9 @@ void SwitchInputDriver::Poll(size_t index) {
     RouteRecording(held, left, right);
   }
   DispatchMenuShortcuts(slot, held);
+  if ((held & HidNpadButton_Minus) && g_minus_dpad_handler.load(std::memory_order_acquire)) {
+    held &= ~uint64_t(HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_Left | HidNpadButton_Right);
+  }
   X_INPUT_GAMEPAD gamepad{};
   uint16_t buttons = 0;
   const auto& fronts =
@@ -863,6 +875,20 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
   }
   slot.menu_shortcuts = ab_now ? (slot.menu_shortcuts | kBitAb)
                                  : (slot.menu_shortcuts & ~kBitAb);
+
+  // bo1-nx: MINUS + D-pad Right/Left goes to the app's handler (SetMinusDpadHandler), once per press.
+  if (MinusDpadHandler handler = g_minus_dpad_handler.load(std::memory_order_acquire)) {
+    const bool minus = (held & HidNpadButton_Minus) != 0;
+    const struct {
+      uint64_t button, bit;
+      int direction;
+    } kCombos[] = {{HidNpadButton_Right, uint64_t(1) << 9, 1}, {HidNpadButton_Left, uint64_t(1) << 10, -1}};
+    for (const auto& combo : kCombos) {
+      const bool now = minus && (held & combo.button) != 0;
+      if (now && !(slot.menu_shortcuts & combo.bit)) handler(combo.direction);
+      slot.menu_shortcuts = now ? (slot.menu_shortcuts | combo.bit) : (slot.menu_shortcuts & ~combo.bit);
+    }
+  }
 }
 
 SwitchInputDriver::Slot* SwitchInputDriver::FindSlot(DeviceId id) {

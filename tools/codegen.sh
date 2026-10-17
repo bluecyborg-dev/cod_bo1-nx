@@ -32,4 +32,6 @@ if ! ( cd "$APP" && REX_MAX_JUMP_TABLE_ENTRIES=1024 "$REXGLUE" codegen bo1_manif
   exit 1
 fi
 [[ -f "$APP/generated/default/sources.cmake" ]] || { echo "error: the generator produced no app/generated/default" >&2; exit 1; }
+# Loop barriers and the REX_GUEST_MEM qualifier (BO1_GUEST_PLAIN_MEMORY); no change to the default build.
+python3 "$ROOT/tools/codegen_post.py"
 echo "ok: $(ls "$APP"/generated/default/*.cpp | wc -l | tr -d ' ') C++ files in app/generated/default"

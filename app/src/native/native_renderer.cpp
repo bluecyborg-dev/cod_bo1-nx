@@ -90,8 +90,30 @@ REXCVAR_DEFINE_BOOL(bo1_debug_mip_watch, false, "BO1",
                     "Debug: watch the mip data of large DXT textures (entropy at first sight and later changes)");
 REXCVAR_DEFINE_BOOL(bo1_native_skip_aliased_depth, true, "BO1",
                     "Native renderer: skip depth-only draws into a depth target that lies inside a larger one with "
-                    "the same pitch and is never resolved itself. Each EDRAM base is its own image here, so those "
-                    "draws (the far half of BO1's 1024x2048 sun shadow map) never reached what the game resolves");
+                    "the same pitch, drawn this frame and not resolved yet. Each EDRAM base is its own image here, so "
+                    "those draws (the far half of BO1's 1024x2048 sun shadow map) never reached what the game resolves");
+// bo1-nx: the "min" shadow preset (bo1_shadows). Shadow map draws are depth-only draws into a depth target without
+// MSAA (the scene's depth uses the game's 2x MSAA); skipping them leaves each map as its clear left it, so nothing is
+// in shadow, while the game keeps its shadow system on (with it off, models flicker between lit and dark).
+// bo1-nx: BO1 draws its opaque scene twice: a depth-only prepass into the scene's depth buffer (~660 draws a frame in
+// Kino der Toten), then the colour pass, which tests depth (greater-or-equal: BO1's depth is reversed) and writes it
+// itself. Skipping the prepass leaves the colour pass with the same result and saves the renderer those draws; the GPU
+// loses the early rejection of hidden pixels the prepass gave. Prepass draws: depth-only, depth written, into a
+// multisampled target (shadow maps have no MSAA). Mass Effect's port skips its prepass the same way. Off by default:
+// on the console (2026-10-16) skipping it cut the renderer's draws 987 -> 559 per frame but raised GPU time 36 -> 42 ms
+// per frame, and the GPU is the limit (the ring thread waited on fences a third of the time).
+REXCVAR_DEFINE_BOOL(bo1_native_skip_prepass, false, "BO1",
+                    "Native renderer: skip the game's depth-only prepass (the colour pass sets depth itself)");
+// bo1-nx: ZCULL (the GPU's coarse hidden-surface rejection). NVK only gives a depth image a ZCULL plane when nothing but
+// depth rendering writes it, so no VK_IMAGE_USAGE_TRANSFER_DST_BIT ("[nvk] ZCULL: NO plane ... incompatible usages"
+// in the log). Our depth targets used it twice, both at creation: the initial clear (now a clearing render pass) and the
+// copy of the old content when a target grows (avoided by creating depth targets at the full height their EDRAM base
+// allows; a target that still grows keeps TRANSFER_DST and goes without ZCULL).
+REXCVAR_DEFINE_BOOL(bo1_native_zcull, false, "BO1",
+                    "Native renderer: create depth targets so NVK can use ZCULL on them (full EDRAM height, cleared "
+                    "by a render pass instead of a transfer)");
+REXCVAR_DEFINE_BOOL(bo1_native_skip_shadow_maps, false, "BO1",
+                    "Native renderer: skip the draws into shadow maps (set by bo1_shadows=min)");
 REXCVAR_DEFINE_BOOL(bo1_native_memexport_copy, true, "BO1",
                     "Native renderer: do BO1's GPU memory copy (a memexport vertex shader) on the CPU; its texture "
                     "streamer copies the low mips into place with it");
@@ -343,9 +365,12 @@ struct RenderTarget {
   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
   uint32_t width = 0;
   uint32_t height = 0;
+  // bo1-nx: the tallest height draws and resolves asked for. With bo1_native_zcull a depth image is taller than that
+  // (its full EDRAM range); DepthContainer must use what is really drawn.
+  uint32_t used_height = 0;
   uint64_t last_used_frame = 0;
   uint64_t last_drawn_frame = 0;  // bo1-nx: last frame a pass rendered into it
-  bool ever_resolved = false;     // bo1-nx: a resolve has read it (see bo1_native_skip_aliased_depth)
+  bool drawn_since_resolve = false;  // bo1-nx: a draw went into it after its last resolve
 };
 
 // The attachments of a rendering scope: color 0-3 and depth.
@@ -623,14 +648,20 @@ struct Renderer::Impl {
       resolve_exp_bias[page] = bias;
     }
   }
-  uint32_t trace_pass_skips[16] = {};
+  uint32_t trace_pass_skips[32] = {};
+  // Depth state of the pass's draws: "c" color written or "d" depth only, z test on/off, z write, compare function.
+  std::map<std::string, uint32_t> trace_pass_depth;
   void TraceEndPass() {
     if (!trace_frame) return;
     std::string skips;
-    for (uint32_t i = 0; i < 16; ++i) {
+    for (uint32_t i = 0; i < 32; ++i) {
       if (trace_pass_skips[i]) skips += fmt::format(" {}:{}", i, trace_pass_skips[i]);
     }
-    REXLOG_INFO("[trace]   {} draws, skipped{}", trace_pass_draws, skips.empty() ? " none" : skips);
+    std::string depth;
+    for (const auto& [key, n] : trace_pass_depth) depth += fmt::format(" {}x{}", key, n);
+    REXLOG_INFO("[trace]   {} draws, skipped{}; depth state{}", trace_pass_draws, skips.empty() ? " none" : skips,
+                depth.empty() ? " -" : depth);
+    trace_pass_depth.clear();
     trace_pass_draws = 0;
     std::memset(trace_pass_skips, 0, sizeof(trace_pass_skips));
   }
@@ -948,6 +979,9 @@ struct Renderer::Impl {
     VulkanShader* active_ps = nullptr;
     uint32_t initiator_state = 0;
     uint32_t skip_reason = UINT32_MAX;
+    RenderTarget* alias_container = nullptr;  // bo1-nx: see bo1_native_skip_aliased_depth
+    bool shadow_map = false;                   // bo1-nx: see bo1_native_skip_shadow_maps
+    bool prepass = false;                      // bo1-nx: see bo1_native_skip_prepass
     VulkanShader* vs = nullptr;
     VulkanShader* ps = nullptr;
     bool primitive_polygonal = false;
@@ -1807,7 +1841,7 @@ struct Renderer::Impl {
   RenderTargetKey CanonicalTargetKey(const RenderTargetKey& guest_key);
   RenderTarget* GetRenderTargetCanonical(const RenderTargetKey& key, uint32_t min_height);
   RenderTarget* FindClearAlias(const RenderTargetKey& guest_key, uint32_t& scale_x, uint32_t& scale_y);
-  bool DepthInsideAnother(const RenderTarget& rt) const;
+  RenderTarget* DepthContainer(const RenderTarget& rt) const;
   void EndPass() {
     if (in_pass) {
       dfn().vkCmdEndRendering(cmd());
@@ -3003,22 +3037,23 @@ RenderTargetKey Renderer::Impl::CanonicalTargetKey(const RenderTargetKey& guest_
   return key;
 }
 
-// bo1-nx: whether a depth target's first EDRAM tile lies inside another depth target with the same pitch, MSAA and
-// format, which on the console would be the same memory.
-bool Renderer::Impl::DepthInsideAnother(const RenderTarget& rt) const {
+// bo1-nx: the depth target, with the same pitch, MSAA and format, whose EDRAM range holds this one's first tile (on
+// the console the same memory), or nullptr.
+RenderTarget* Renderer::Impl::DepthContainer(const RenderTarget& rt) const {
   const RenderTargetKey& k = rt.key;
   const uint32_t pitch_tiles = (k.pitch * (k.msaa >= 2 ? 2 : 1) + 79) / 80;
   const uint32_t rows_per_tile = k.msaa >= 1 ? 8 : 16;
-  if (!pitch_tiles) return false;
+  if (!pitch_tiles) return nullptr;
   for (const auto& [key, other] : render_targets) {
     if (other.get() == &rt || !key.is_depth || key.pitch != k.pitch || key.msaa != k.msaa ||
         key.format != k.format || key.base_tiles >= k.base_tiles) {
       continue;
     }
-    const uint32_t end = key.base_tiles + pitch_tiles * ((other->height + rows_per_tile - 1) / rows_per_tile);
-    if (k.base_tiles < end) return true;
+    const uint32_t end =
+        key.base_tiles + pitch_tiles * ((other->used_height + rows_per_tile - 1) / rows_per_tile);
+    if (k.base_tiles < end) return other.get();
   }
-  return false;
+  return nullptr;
 }
 
 RenderTarget* Renderer::Impl::FindClearAlias(const RenderTargetKey& guest_key, uint32_t& scale_x,
@@ -3047,6 +3082,7 @@ RenderTarget* Renderer::Impl::GetRenderTargetCanonical(const RenderTargetKey& ke
     old = it->second.get();
     old->last_used_frame = frame;
     if (old->height >= min_height) {
+      old->used_height = std::max(old->used_height, min_height);
       return old;
     }
   }
@@ -3054,6 +3090,18 @@ RenderTarget* Renderer::Impl::GetRenderTargetCanonical(const RenderTargetKey& ke
   rt->key = key;
   rt->width = std::max(key.pitch, 1u);
   rt->height = rex::align(min_height, 16u);
+  rt->used_height = std::max(min_height, old ? old->used_height : 0u);
+  // bo1-nx (bo1_native_zcull): depth at the full height of its EDRAM range, so it never grows.
+  const bool zcull = key.is_depth && REXCVAR_GET(bo1_native_zcull);
+  if (zcull) {
+    const uint32_t pitch_tiles = (key.pitch * (key.msaa >= 2 ? 2 : 1) + 79) / 80;
+    if (pitch_tiles) {
+      const uint32_t full = (2048 - std::min(key.base_tiles, 2047u)) / pitch_tiles * (key.msaa >= 1 ? 8 : 16);
+      rt->height = std::max(rt->height, rex::align(std::min(full, 2048u), 16u));
+    }
+  }
+  // A depth target that grows from an old one gets the old content by a copy, which needs TRANSFER_DST.
+  const bool zcull_usage = zcull && !old;
   rt->samples = VkSampleCountFlagBits(1u << key.msaa);
   rt->format = key.is_depth ? DepthFormatFor(key.format)
                             : ColorFormatToVk(xenos::ColorRenderTargetFormat(key.format));
@@ -3070,7 +3118,7 @@ RenderTarget* Renderer::Impl::GetRenderTargetCanonical(const RenderTargetKey& ke
   info.usage = (key.is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                                    VK_IMAGE_USAGE_SAMPLED_BIT
                              : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
-               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (zcull_usage ? 0 : VK_IMAGE_USAGE_TRANSFER_DST_BIT);
   info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!rex::ui::vulkan::util::CreateDedicatedAllocationImage(
           device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal, rt->image,
@@ -3104,16 +3152,36 @@ RenderTarget* Renderer::Impl::GetRenderTargetCanonical(const RenderTargetKey& ke
   VkImageMemoryBarrier barrier = {};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   barrier.srcAccessMask = 0;
-  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = zcull_usage ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
   barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
   barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.image = rt->image;
   barrier.subresourceRange = view.subresourceRange;
-  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             zcull_usage ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                                         : VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &barrier);
-  if (key.is_depth) {
+  if (zcull_usage) {
+    // Cleared by a rendering scope that only clears: no transfer write, so NVK keeps the ZCULL plane valid.
+    VkRenderingAttachmentInfo depth = {};
+    depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depth.imageView = rt->view;
+    depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.clearValue.depthStencil = {1.0f, 0};
+    VkRenderingInfo clear_info = {};
+    clear_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    clear_info.renderArea.extent = {rt->width, rt->height};
+    clear_info.layerCount = 1;
+    clear_info.pDepthAttachment = &depth;
+    clear_info.pStencilAttachment = HasStencil(rt->format) ? &depth : nullptr;
+    dfn().vkCmdBeginRendering(c, &clear_info);
+    dfn().vkCmdEndRendering(c);
+  } else if (key.is_depth) {
     VkClearDepthStencilValue clear = {1.0f, 0};
     vkCmdClearDepthStencilImage(c, rt->image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                                       &view.subresourceRange);
@@ -3142,12 +3210,12 @@ RenderTarget* Renderer::Impl::GetRenderTargetCanonical(const RenderTargetKey& ke
     retired_render_targets.push_back({frame, old->image, old->view, old->sample_view, old->memory});
   }
   VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                           VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
-  dfn().vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+  dfn().vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
@@ -3156,9 +3224,9 @@ RenderTarget* Renderer::Impl::GetRenderTargetCanonical(const RenderTargetKey& ke
   render_targets[key] = std::move(rt);
   ++stats().render_targets_created;
   ++rt_generation;
-  REXLOG_INFO("[native] Render target {}x{} {} format {} at tile {}, {}x MSAA", result->width,
+  REXLOG_INFO("[native] Render target {}x{} {} format {} at tile {}, {}x MSAA{}", result->width,
               result->height, key.is_depth ? "depth" : "color", key.format, key.base_tiles,
-              1u << key.msaa);
+              1u << key.msaa, zcull_usage ? ", ZCULL-capable" : (zcull ? ", grew: no ZCULL" : ""));
   return result;
 }
 
@@ -3671,10 +3739,13 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
   // against the new ones.
   st.rt_generation = rt_generation;
   if (targets.Empty()) return fail(7);
-  if (targets.depth && !targets.color[0] && !targets.color[1] && !targets.color[2] && !targets.color[3] &&
-      !targets.depth->ever_resolved && REXCVAR_GET(bo1_native_skip_aliased_depth) &&
-      DepthInsideAnother(*targets.depth)) {
-    return fail(14);
+  st.alias_container = nullptr;
+  const bool depth_only =
+      targets.depth && !targets.color[0] && !targets.color[1] && !targets.color[2] && !targets.color[3];
+  st.shadow_map = depth_only && guest_msaa == 0;
+  st.prepass = depth_only && guest_msaa != 0 && depth_control.z_write_enable;
+  if (depth_only && REXCVAR_GET(bo1_native_skip_aliased_depth)) {
+    st.alias_container = DepthContainer(*targets.depth);
   }
 
   // Layout.
@@ -3840,9 +3911,9 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   // 15 immediate indices.
   auto skip = [&](uint32_t reason) {
     ++stats().draws_skipped;
-    ++stats().skipped_by_reason[reason & 15];
+    ++stats().skipped_by_reason[reason & 31];
     if (trace_frame) {
-      ++trace_pass_skips[reason & 15];
+      ++trace_pass_skips[reason & 31];
       if (trace_skip_logged < 300) {
         ++trace_skip_logged;
         auto dc = r.Get<reg::RB_DEPTHCONTROL>();
@@ -3919,6 +3990,24 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   DrawSetup& st = setup;
   if (st.skip_reason != UINT32_MAX) {
     return skip(st.skip_reason);
+  }
+  // bo1-nx: a depth-only draw into a target inside a larger one drawn this frame and still waiting for its resolve:
+  // the second half of BO1's 1024x2048 sun shadow map (base 1216 inside the map at 384), which the resolve of 384
+  // never reads here because each base is its own image. After that resolve, the same base 1216 holds a spot light's
+  // shadow map, which is drawn.
+  if (st.alias_container && st.alias_container->drawn_since_resolve &&
+      st.alias_container->last_drawn_frame == frame) {
+    return skip(14);
+  }
+  if (st.shadow_map && REXCVAR_GET(bo1_native_skip_shadow_maps)) {
+    return skip(15);
+  }
+  if (st.prepass && REXCVAR_GET(bo1_native_skip_prepass)) {
+    return skip(16);
+  }
+  for (RenderTarget* rt :
+       {st.targets.color[0], st.targets.color[1], st.targets.color[2], st.targets.color[3], st.targets.depth}) {
+    if (rt) rt->drawn_since_resolve = true;
   }
   VulkanShader* vs = st.vs;
   VulkanShader* ps = st.ps;
@@ -4618,6 +4707,12 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   ++stats().draws;
   if (trace_frame) {
     ++trace_pass_draws;
+    {
+      auto dc = r.Get<reg::RB_DEPTHCONTROL>();
+      const bool color = (r[rex::graphics::XE_GPU_REG_RB_COLOR_MASK] & 0xFFFF) != 0;
+      ++trace_pass_depth[fmt::format("{}{}{}f{}", color ? "c" : "d", dc.z_enable ? "z" : "-",
+                                     dc.z_write_enable ? "w" : "-", uint32_t(dc.zfunc))];
+    }
     // Details of the draws of small passes (post-processing): shaders, target exponent bias, sampled textures.
     if (trace_pass_draws <= 2 && trace_draws_detailed < 120 &&
         (!targets.depth || targets.Empty() || st.ps)) {
@@ -4782,10 +4877,7 @@ void Renderer::Impl::Resolve() {
     }
   }
   RenderTarget* source = GetRenderTarget(source_key, uint32_t(y1));
-  if (source && !source->ever_resolved) {
-    source->ever_resolved = true;
-    ++rt_generation;  // setups that skipped draws into it are rebuilt
-  }
+  if (source) source->drawn_since_resolve = false;
   if (trace_frame) {
     TraceEndPass();
     auto trace_dest = r.Get<reg::RB_COPY_DEST_INFO>();

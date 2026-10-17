@@ -96,7 +96,7 @@ struct RendererStats {
   // The part of frame_fence_wait_ns spent waiting for stream space.
   uint64_t frame_stream_wait_ns = 0;
   // Draws skipped, by reason (see SkipReason in the .cpp).
-  uint64_t skipped_by_reason[16] = {};
+  uint64_t skipped_by_reason[32] = {};
 };
 
 class Renderer {

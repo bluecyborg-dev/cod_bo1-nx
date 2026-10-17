@@ -65,7 +65,7 @@ REXCVAR_DEFINE_INT32(bo1_native_ring_core, -1, "BO1",
 // which feels choppy even at a good average. Holding the interrupt to vblank
 // boundaries, at least this many vblanks after the previous one, gives the
 // even cadence a console gets from vsync; 2 is a steady 30.
-REXCVAR_DEFINE_BOOL(bo1_pace_before_present, false, "BO1",
+REXCVAR_DEFINE_BOOL(bo1_pace_before_present, true, "BO1",
                     "Hold a frame for the frame rate cap before presenting it rather than "
                     "after, so frames go on screen evenly spaced");
 REXCVAR_DEFINE_UINT32(bo1_min_frame_vblanks, 3, "BO1",
@@ -696,7 +696,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         REXLOG_INFO("[native] state changes by register (10 s):{}", list);
       }
       std::string reasons;
-      for (uint32_t i = 0; i < 16; ++i) {
+      for (uint32_t i = 0; i < 32; ++i) {
         uint64_t n = s.skipped_by_reason[i] - reported_render_.skipped_by_reason[i];
         if (n) reasons += fmt::format(" {}:{}", i, n);
       }
