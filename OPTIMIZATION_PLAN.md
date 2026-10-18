@@ -52,7 +52,10 @@ penettrator/prototype2-nx (same stack as ours; details in `docs/OTHER_PORTS_RESE
      settings and play sequence constant. Use total/thread CPU, frame timing, hitch counts and the user's experience
      to judge the permission change. A mask of `0xF` grants access; it does not show where BO1 actually ran. Keep
      core 3 shared with system services. The current profile points to renderer hashing/comparison work as the first
-     low-risk optimization candidate; see `docs/OPTIMIZATION_LOG.md`.
+     low-risk optimization candidate; see `docs/OPTIMIZATION_LOG.md`. For both runs, launch with
+     `--bo1_debug_exec=devmap+zombie_theater --bo1_profile_log=true --bo1_profile_stacks=true` so the map load and
+     CPU profile are repeatable. The 2026-10-17 19:49 run omitted these args; it supplies renderer timings only and
+     does not count as the matched comparison.
 2. [ ] **Hash less in the renderer.** Hashing, compares and copies are ~40 % of our ring thread. Prototype 2's
    renderer copies buffers that change every frame without hashing them first, checks settled ranges of 16 KB or more
    by samples plus a full hash every 16 frames, hashes small settled ranges every 4th frame, and gives pages a CPU
