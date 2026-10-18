@@ -64,10 +64,10 @@ penettrator/prototype2-nx (same stack as ours; details in `docs/OTHER_PORTS_RESE
    hash every 16 frames, hashes small settled ranges every 4th frame, and gives pages a CPU routine just wrote a new
    identity. The new setting leaves our existing change detection unchanged by default; the console comparison is
    still pending. A candidate run with `--bo1_native_geometry_hash_every_16=true --bo1_native_hash_counters=true`
-   is logged, but the user observed FPS falling after a few minutes and the run did not include stack sampling, so it
-   does not establish a win. The next control run leaves the cadence setting off, uses the same map/play sequence,
-   and includes `--bo1_profile_stacks=true` to identify rising CPU work. Treat this as an approximate run-to-run
-   comparison; the rounds and zombie counts can differ. Keep `--bo1_native_geometry_hash_exact=true` for a separate
+   is logged, but the user observed FPS falling after a few minutes and the run does not establish a win. The first
+   cadence-off control enabled 1 kHz stack sampling; the user found it much less stable, and the capture showed long
+   gaps with the GPU idle. Since sampling briefly pauses threads, repeat the default cadence-off Kino run with stack
+   sampling disabled before comparing cadence on/off. Keep `--bo1_native_geometry_hash_exact=true` for a separate
    correctness comparison because a change can be seen frames late.
 3. [ ] **`bo1_native_depth24` A/B** (exists, off, never tested on the console; launch option only): depth at 32 bits
    per pixel instead of D32F_S8, which NVIDIA keeps at 64. The scene depth is `kD24FS8`; check BO1's stencil use
