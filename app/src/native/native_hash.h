@@ -58,21 +58,40 @@ class ChangeDetector {
   }
 
   uint64_t Check(const uint8_t* data, size_t size, uint64_t frame, uint64_t stagger,
-                 uint64_t& bytes_hashed) {
+                 uint64_t& bytes_hashed, uint64_t trusted_every = kTrustedEvery,
+                 bool force_full = false) {
     size_ = size;
     const uint32_t trusted_checks = TrustedChecks();
-    if (unchanged_ >= trusted_checks && (frame + stagger) % kTrustedEvery) {
+    if (force_full) {
+      const uint64_t hash = XXH3_64bits(data, size);
+      bytes_hashed += size;
+      if (hash == hash_ && checked_) {
+        if (unchanged_ < trusted_checks) ++unchanged_;
+      } else {
+        if (checked_ && changes_ < 0xFFFF) ++changes_;
+        unchanged_ = 0;
+      }
+      hash_ = hash;
+      checked_ = true;
+      return hash;
+    }
+    const bool trusted_full_due = unchanged_ >= trusted_checks && trusted_every >= kFullEvery &&
+                                  (frame + stagger) % kFullEvery == 0;
+    if (unchanged_ >= trusted_checks && (frame + stagger) % trusted_every) {
       return hash_;
     }
-    uint64_t sample = Sample(data, size);
-    if (unchanged_ >= StableChecks() && sample == sample_ && (frame + stagger) % kFullEvery) {
-      if (unchanged_ < trusted_checks) {
-        ++unchanged_;
+    uint64_t sample = sample_;
+    if (!trusted_full_due) {
+      sample = Sample(data, size);
+      if (unchanged_ >= StableChecks() && sample == sample_ && (frame + stagger) % kFullEvery) {
+        if (unchanged_ < trusted_checks) {
+          ++unchanged_;
+        }
+        // Small ranges are fully hashed by Sample(); larger ranges read the
+        // eight disjoint sample windows.
+        bytes_hashed += size <= kSamples * kSampleBytes * 2 ? size : kSamples * kSampleBytes;
+        return hash_;
       }
-      // Small ranges are fully hashed by Sample(); larger ranges read the
-      // eight disjoint sample windows.
-      bytes_hashed += size <= kSamples * kSampleBytes * 2 ? size : kSamples * kSampleBytes;
-      return hash_;
     }
     uint64_t hash = XXH3_64bits(data, size);
     bytes_hashed += size;

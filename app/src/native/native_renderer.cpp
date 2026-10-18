@@ -122,6 +122,12 @@ REXCVAR_DEFINE_BOOL(bo1_native_ranged_vertices, true, "BO1",
                     "shader fetches by vertex index, instead of whole vertex buffers");
 REXCVAR_DEFINE_BOOL(bo1_native_hash_counters, false, "BO1",
                     "Diagnostics: time vertex/index data hashing and vertex stream copies");
+REXCVAR_DEFINE_BOOL(bo1_native_geometry_hash_every_16, false, "BO1",
+                    "Experimental: check trusted vertex/index ranges with a full hash every 16 frames, instead of "
+                    "sampling them between full hashes");
+REXCVAR_DEFINE_BOOL(bo1_native_geometry_hash_exact, false, "BO1",
+                    "Diagnostics: fully hash every vertex/index range every frame, including frequently rewritten "
+                    "ranges");
 REXCVAR_DEFINE_BOOL(bo1_native_depth24, false, "BO1",
                     "Store depth in 32 bits per pixel (24-bit depth with stencil, or float "
                     "without) instead of 32-bit float with stencil, which NVIDIA GPUs keep "
@@ -943,13 +949,18 @@ struct Renderer::Impl {
   uint64_t RangeHash(VertexHash& known, const uint8_t* data, uint32_t bytes, uint32_t address) {
     if (known.frame == frame) return known.hash;
     known.frame = frame;
-    if (known.changes >= 4 && (frame & 15)) {
+    const bool exact = REXCVAR_GET(bo1_native_geometry_hash_exact);
+    if (!exact && known.changes >= 4 && (frame & 15)) {
       known.hash = (frame + 1) * 0xD1B54A32D192ED03ull ^ (uint64_t(address) << 20) ^ bytes;
       return known.hash;
     }
     const bool measure_time = REXCVAR_GET(bo1_native_hash_counters);
     const uint64_t hash_start = measure_time ? NowNs() : 0;
-    uint64_t content = known.detector.Check(data, bytes, frame, address >> 4, geometry_hash_bytes);
+    const uint64_t trusted_every = REXCVAR_GET(bo1_native_geometry_hash_every_16)
+                                       ? ChangeDetector::kFullEvery
+                                       : ChangeDetector::kTrustedEvery;
+    uint64_t content = known.detector.Check(data, bytes, frame, address >> 4, geometry_hash_bytes,
+                                            trusted_every, exact);
     if (measure_time) geometry_hash_ns += NowNs() - hash_start;
     known.changes = content != known.content ? std::min(known.changes + 1, 8u) : 0;
     known.content = content;
