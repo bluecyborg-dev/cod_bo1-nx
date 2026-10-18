@@ -187,6 +187,9 @@ inconclusive; the user has requested a separate overclocked retest.
 - [ ] Mesa 26.2.4 for Horizon (mesa-switch PR #5) and its fixes (depth-stencil memory bindings, GPFIFO accounting).
   The 26.2.3 work (ZCULL, shader cache lock contention, redundant UBO updates) is already in our pin `d4a00ea0ab3`.
 - [ ] Native replacements of the hottest game functions, with guards (needs the profile).
+- [x] **Targeted REA/Ghidra pilot** on the Xenon worker path. `PowerPC:BE:64:64-32addr` recovers full worker and
+  callback bodies from the synthetic ELF carrier; compare reservation-loop pseudocode with XenonRecomp output before
+  making changes. See `docs/REVERSE_ENGINEERING_PILOT.md`.
 - [ ] Offline shader library.
 - [ ] deko3d renderer instead of NVK.
 
