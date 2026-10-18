@@ -137,9 +137,9 @@ REXCVAR_DEFINE_BOOL(bo1_native_gpu_profile, false, "BO1",
 REXCVAR_DEFINE_BOOL(bo1_native_record_thread, false, "BO1",
                     "Make the Vulkan calls of draws on a second thread, so the command ring "
                     "thread prepares the next draw meanwhile");
-REXCVAR_DEFINE_BOOL(bo1_native_msaa, true, "BO1",
-                    "Render with the multisampling the game asks for; off draws every target "
-                    "with one sample, which costs the GPU much less memory bandwidth");
+REXCVAR_DEFINE_BOOL(bo1_native_msaa, true, "BO1 A/B",
+                    "Restart required: on uses 2x MSAA; off uses one sample and can reduce GPU bandwidth")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(bo1_native_async_pipelines, true, "BO1",
                     "Native renderer: compile new pipelines on a worker thread and skip the "
                     "draws that need them until they are ready, instead of stalling the frame");

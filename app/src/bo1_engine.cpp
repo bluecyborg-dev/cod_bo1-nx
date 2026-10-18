@@ -440,9 +440,14 @@ REXCVAR_DEFINE_BOOL(bo1_profile_stacks, false, "bo1",
                     "briefly); same as logs/rex/stacks_profile.flag");
 REXCVAR_DEFINE_BOOL(bo1_profile_log, false, "bo1",
                     "Switch: copy every 10 s profiler report (logs/rex/rex_profile.log) into the log");
+REXCVAR_DEFINE_INT32(bo1_profile_workload_core_mask, 15, "bo1",
+                     "Switch profiler A/B: workload thread mask 7 or 15; process permission stays 15 so core 3 "
+                     "idle can be measured");
 
 #if defined(__SWITCH__)
+extern "C" void RexSwitchPerfSetABCondition(const char* condition);
 extern "C" bool RexSwitchPerfStacksWanted(void) { return REXCVAR_GET(bo1_profile_stacks); }
+extern "C" int RexSwitchPerfWorkloadCoreMask(void) { return REXCVAR_GET(bo1_profile_workload_core_mask); }
 
 // The profiler calls this on its own thread, which runs at a high priority (0x2A) and pauses other threads to sample
 // them: it must not log there (a log call takes the logger's lock and writes to the SD card and the network). The
@@ -508,8 +513,9 @@ REXCVAR_DEFINE_STRING(bo1_dvars,
 // Test preset for the frames that stutter: on the console (2026-10-16) the frames of 70-199 ms averaged ~1,370 draws
 // against ~860 for an average frame (GPU wait 23 ms): crowds and effects. These skip particle effects and elements
 // that are off screen or too small, drop the big particle clouds, and keep fewer corpses. Added to bo1_dvars.
-REXCVAR_DEFINE_BOOL(bo1_fx_lite, false, "bo1",
-                    "Fewer effects: fx_cull_effect_spawn/elem_spawn/elem_draw 1, fx_drawClouds 0, ai_corpseCount 3");
+REXCVAR_DEFINE_BOOL(bo1_fx_lite, false, "BO1 A/B",
+                    "LIVE A/B: fewer effects and corpses. Settings overlay: L+R+Right, BO1 A/B. Changes apply in about "
+                    "0.5 s; Switch profiler blocks are tagged. Ignore the first partial 10 s block after switching.");
 REXCVAR_DECLARE(bool, bo1_native_skip_shadow_maps);
 REXCVAR_DEFINE_STRING(bo1_shadows, "off", "bo1",
                       "Dynamic shadows, live (settings menu: L+R+Right): off (sm_enable 0: fastest, but models flicker "
@@ -708,32 +714,65 @@ void WriteLatchedShadowDvars(uint8_t* base, const std::string& preset) {
   }
 }
 
+std::string BuildEngineDvarBatch(const std::string& configured, bool include_stream, bool fx_lite,
+                                bool reset_fx_defaults) {
+  std::string list;
+  auto append = [&](std::string_view part) {
+    if (part.empty()) return;
+    if (!list.empty()) list += "; ";
+    list.append(part);
+  };
+  if (reset_fx_defaults) {
+    // Restore the game's registered defaults when leaving the live preset. Apply user overrides after these.
+    append("fx_cull_effect_spawn 0; fx_cull_elem_spawn 1; fx_cull_elem_draw 1; fx_drawClouds 1; ai_corpseCount 5");
+  }
+  append(configured);
+  if (fx_lite) {
+    append("fx_cull_effect_spawn 1; fx_cull_elem_spawn 1; fx_cull_elem_draw 1; fx_drawClouds 0; ai_corpseCount 3");
+  }
+  std::replace(list.begin(), list.end(), '+', ' ');
+
+  std::string out;
+  for (size_t start = 0; start < list.size();) {
+    size_t end = list.find(';', start);
+    if (end == std::string::npos) end = list.size();
+    std::string item = list.substr(start, end - start);
+    start = end + 1;
+    const size_t first = item.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) continue;
+    const size_t last = item.find_last_not_of(" \t\r\n");
+    item = item.substr(first, last - first + 1);
+    if (!include_stream && item.rfind("r_stream", 0) == 0) continue;
+    out += (out.empty() ? "set " : "; set ") + item;
+  }
+  return out;
+}
+
+struct EngineDvarBatches {
+  std::string initial_default;
+  std::string initial_fx_lite;
+  std::string periodic_default;
+  std::string periodic_fx_lite;
+  std::string live_fx_lite;
+  std::string live_default;
+};
+
+EngineDvarBatches BuildEngineDvarBatches(const std::string& configured) {
+  EngineDvarBatches batches;
+  batches.initial_default = BuildEngineDvarBatch(configured, true, false, false);
+  batches.initial_fx_lite = BuildEngineDvarBatch(configured, true, true, false);
+  batches.periodic_default = BuildEngineDvarBatch(configured, false, false, false);
+  batches.periodic_fx_lite = BuildEngineDvarBatch(configured, false, true, false);
+  batches.live_fx_lite = batches.periodic_fx_lite;
+  batches.live_default = BuildEngineDvarBatch(configured, false, false, true);
+  return batches;
+}
+
 void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
   // bo1_dvars once; afterwards every 5 s all but r_stream*: writing r_stream (even with the same value) while a map
-  // loads restarts the streaming system and the load never finished (reproduced on the Mac and the console). The
-  // shadow preset goes with them, and also at once when it is changed in the settings menu.
-  static std::string periodic;
-  static const std::string commands = [] {
-    std::string list = REXCVAR_GET(bo1_dvars);
-    if (REXCVAR_GET(bo1_fx_lite)) {
-      list += "; fx_cull_effect_spawn 1; fx_cull_elem_spawn 1; fx_cull_elem_draw 1; fx_drawClouds 0; ai_corpseCount 3";
-    }
-    std::replace(list.begin(), list.end(), '+', ' ');
-    std::string out;
-    size_t start = 0;
-    while (start < list.size()) {
-      size_t end = list.find(';', start);
-      if (end == std::string::npos) end = list.size();
-      std::string item = list.substr(start, end - start);
-      start = end + 1;
-      const size_t first = item.find_first_not_of(' ');
-      if (first == std::string::npos) continue;
-      item = item.substr(first, item.find_last_not_of(' ') - first + 1);
-      out += (out.empty() ? "set " : "; set ") + item;
-      if (item.rfind("r_stream", 0) != 0) periodic += (periodic.empty() ? "set " : "; set ") + item;
-    }
-    return out;
-  }();
+  // loads restarts the streaming system and the load never finished (reproduced on the Mac and the console). Shadows
+  // and bo1_fx_lite are live: transitions are queued on the game thread and tagged in profiler A/B blocks.
+  static const EngineDvarBatches batches = BuildEngineDvarBatches(REXCVAR_GET(bo1_dvars));
   // Debugging aid: BO1_DEBUG_SHADOW_CYCLE="off,min" switches bo1_shadows to the next preset every 20 s, as the
   // settings menu would (checks live switching on the Mac, which has no controller menu in scripted runs).
   static const std::vector<std::string> cycle = [] {
@@ -760,6 +799,8 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
     }
   }
   static std::atomic<uint64_t> first_ns{0}, last_ns{0}, shadows_checked_ns{0};
+  static uint64_t fx_lite_checked_ns = 0;
+  static bool applied_fx_lite = false;
   // Only this hook's thread reads these two.
   static std::string shadows = REXCVAR_GET(bo1_shadows);
   static std::string shadow_commands = ShadowCommands(shadows);
@@ -783,16 +824,36 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
       return;
     }
   }
+  const bool fx_lite = REXCVAR_GET(bo1_fx_lite);
+  if (last && now - fx_lite_checked_ns >= 500'000'000ull) {
+    fx_lite_checked_ns = now;
+    if (fx_lite != applied_fx_lite) {
+      const std::string& batch = fx_lite ? batches.live_fx_lite : batches.live_default;
+      if (!batch.empty()) QueueCommand(ctx, base, batch);
+      applied_fx_lite = fx_lite;
+#if defined(__SWITCH__)
+      RexSwitchPerfSetABCondition(fx_lite ? "bo1_fx_lite=ON" : "bo1_fx_lite=OFF");
+#endif
+      REXLOG_INFO("bo1: A/B phase queued: bo1_fx_lite={} ({})", fx_lite ? "ON" : "OFF", batch);
+      return;
+    }
+  }
   if (last && now - last < 5'000'000'000ull) return;
   if (!last_ns.compare_exchange_strong(last, now)) return;
-  std::string batch = last ? periodic : commands;
+  std::string batch = last ? (fx_lite ? batches.periodic_fx_lite : batches.periodic_default)
+                           : (fx_lite ? batches.initial_fx_lite : batches.initial_default);
   if (!shadow_commands.empty()) batch += (batch.empty() ? "" : "; ") + shadow_commands;
+  if (!last) {
+    applied_fx_lite = fx_lite;
+    REXCVAR_SET(bo1_native_skip_shadow_maps, shadows == "min");
+#if defined(__SWITCH__)
+    RexSwitchPerfSetABCondition(fx_lite ? "bo1_fx_lite=ON" : "bo1_fx_lite=OFF");
+#endif
+    REXLOG_INFO("bo1: A/B phase started: bo1_fx_lite={}", fx_lite ? "ON" : "OFF");
+  }
   if (batch.empty()) return;
   QueueCommand(ctx, base, batch);
-  if (!last) {
-    REXCVAR_SET(bo1_native_skip_shadow_maps, shadows == "min");
-    REXLOG_INFO("bo1: engine settings queued: {}", batch);
-  }
+  if (!last) REXLOG_INFO("bo1: engine settings queued: {}", batch);
 }
 
 void MaybeInjectDebugCommand(PPCContext& ctx, uint8_t* base) {

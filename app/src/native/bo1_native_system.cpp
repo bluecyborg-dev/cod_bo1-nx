@@ -87,12 +87,15 @@ REXCVAR_DEFINE_STRING(bo1_renderer, "native", "BO1",
 
 #if defined(__SWITCH__)
 extern "C" {
+#include <switch/arm/counter.h>
 #include <switch/kernel/svc.h>
 }
 extern "C" void RexGmSetReadOnlyMapped(bool enabled);
 // The frame counter the console FPS overlay and the profiler read (the
 // emulated path counts its swaps there too).
 extern "C" void RexSwitchPerfCount(unsigned id);
+// Marks long frames so the SDK profiler can report only stack samples taken during them.
+extern "C" void RexSwitchPerfHitch(uint64_t start, uint64_t end);
 #endif
 
 namespace bo1::native {
@@ -1178,6 +1181,14 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     const double ms =
         double(std::chrono::duration_cast<std::chrono::microseconds>(now - previous).count()) /
         1000.0;
+#if defined(__SWITCH__)
+    const auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous).count();
+    if (duration_ns >= 100000000) {
+      const uint64_t end_tick = armGetSystemTick();
+      const uint64_t duration_ticks = armNsToTicks(static_cast<uint64_t>(duration_ns));
+      RexSwitchPerfHitch(end_tick - duration_ticks, end_tick);
+    }
+#endif
     const RendererStats& s = renderer_.stats();
     const uint64_t pipelines = s.pipelines_created - frame_start_pipelines_;
     const uint64_t shaders = s.shaders_translated - frame_start_shaders_;

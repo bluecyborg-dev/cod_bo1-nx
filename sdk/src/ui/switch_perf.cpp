@@ -13,6 +13,8 @@
  *    kernel.
  *  - Exact CPU of each thread: the kernel keeps each thread's CPU time (svcGetInfo with
  *    InfoType_ThreadTickCount, 13.0.0+), with its priority, its preferred core and its core mask.
+ *  - System busy share by core: four sleeping helpers, one pinned per CPU, sample IdleTickCount and
+ *    armGetSystemTick once per report. This includes Horizon services and interrupts, not only this process.
  *  - Where it is spent: sampling at 1 kHz. A high-priority thread pauses a busy thread
  *    (svcSetThreadActivity), reads its pc, its lr and its stack through the x29 chain
  *    (svcGetThreadContext3) and resumes it. The stacks also tell what a thread stopped in the
@@ -40,6 +42,7 @@
  */
 
 #include <malloc.h>
+#include <mutex>
 #include <unistd.h>
 
 // libnx: the end of the heap that newlib's sbrk hands out (see HeapState).
@@ -110,6 +113,9 @@ std::atomic<uint32_t> g_resolution{(1280u << 16) | 720u};
 constexpr size_t kLabelBytes = 96;
 char g_labels[2][kLabelBytes]{};
 std::atomic<uint32_t> g_label_seq{0};
+constexpr size_t kABConditionBytes = 64;
+char g_ab_conditions[2][kABConditionBytes]{};
+std::atomic<uint32_t> g_ab_condition_seq{0};
 std::atomic<uint32_t> g_report_index{0};
 
 void ReadLabel(char out[kLabelBytes]) {
@@ -121,6 +127,16 @@ void ReadLabel(char out[kLabelBytes]) {
       return;
     }
   }
+}
+
+void ReadABCondition(char out[kABConditionBytes]) {
+  for (int tries = 0; tries < 2; ++tries) {
+    const uint32_t seq = g_ab_condition_seq.load(std::memory_order_acquire);
+    std::memcpy(out, g_ab_conditions[seq & 1], kABConditionBytes);
+    out[kABConditionBytes - 1] = 0;
+    if (g_ab_condition_seq.load(std::memory_order_acquire) == seq) return;
+  }
+  out[0] = 0;
 }
 constexpr u64 kPassiveIntervalNs = 100000000ULL;  // 100 ms, without pausing threads
 // Next to the rexglue logs, in <NRO folder>/logs/rex/.
@@ -152,6 +168,7 @@ std::string ReportPath() {
  */
 extern "C" __attribute__((weak)) bool RexSwitchPerfStacksWanted(void);
 extern "C" __attribute__((weak)) void RexSwitchPerfReportText(const char* text, size_t len);
+extern "C" __attribute__((weak)) int RexSwitchPerfWorkloadCoreMask(void);
 
 // Where the report about to be written starts in rex_profile.log (0 when the file is rewritten).
 long ReportStart(FILE* f) {
@@ -212,9 +229,9 @@ struct Sample {
 };
 
 /*
- * Long frame windows. The renderer calls RexSwitchPerfHitch with the interval of every frame over
- * 45 ms; the report separates the samples taken inside those intervals and says what each thread was
- * doing right then (section "during the hitches"). Only works with stacks_profile.flag.
+ * Long frame windows. The native renderer records frames over 100 ms; the report separates the
+ * samples taken inside those intervals and says what each thread was doing right then (section
+ * "during the hitches"). Only works with stacks_profile.flag or bo1_profile_stacks.
  */
 constexpr size_t kMaxHitches = 256;
 struct WindowHitch {
@@ -222,7 +239,8 @@ struct WindowHitch {
   u64 end;
 };
 WindowHitch g_hitches[kMaxHitches];
-std::atomic<u32> g_num_hitches{0};
+std::mutex g_hitches_mutex;
+u32 g_num_hitches = 0;
 Sample g_samples[kMaxSamples];
 size_t g_sample_count = 0;
 
@@ -364,6 +382,191 @@ void LimitOfMapping(u64* used_mb, u64* cap_mb, u64* process_mb, u64* total_mb) {
 
 u64 g_base = 0, g_text_lo = 0, g_text_hi = 0;
 Thread g_thread;
+std::atomic<u32> g_workload_core_mask{0xF};
+std::atomic<u32> g_workload_mask_adjustments{0};
+constexpr u64 kIdleReportWaitNs = 500000000ULL;
+
+struct IdleCoreWorker {
+  Thread thread{};
+  u32 core = 0;
+  std::atomic<bool> active{false};
+  std::atomic<u32> request_seq{0};
+  std::atomic<u32> complete_seq{0};
+  std::atomic<u32> signal_result{0};
+  std::atomic<u32> pin_result{0};
+  std::atomic<u32> observed_core{UINT32_MAX};
+  std::atomic<u32> info_result{0};
+  std::atomic<u64> sample_tick{0};
+  std::atomic<u64> interval_ticks{0};
+  std::atomic<u64> idle_delta{0};
+  std::atomic<u32> busy_permille{0};
+  std::atomic<bool> valid{false};
+};
+
+IdleCoreWorker g_idle_workers[4];
+std::atomic<u32> g_idle_request_seq{0};
+
+u32 WorkloadCoreMask() {
+  return g_workload_core_mask.load(std::memory_order_relaxed);
+}
+
+bool ApplyWorkloadMaskToThread(Handle handle) {
+  if (!handle || WorkloadCoreMask() != 0x7) return false;
+  s32 preferred = -1;
+  u64 mask = 0;
+  if (R_FAILED(svcGetThreadCoreMask(&preferred, &mask, handle)) || !(mask & 0x8)) return false;
+  u32 restricted = static_cast<u32>(mask & 0x7);
+  if (!restricted) restricted = 0x7;  // relocate a core-3-only workload thread to the three-core baseline.
+  if (preferred < 0 || !(restricted & (1u << preferred))) preferred = __builtin_ctz(restricted);
+  if (R_SUCCEEDED(svcSetThreadCoreMask(handle, preferred, restricted))) {
+    g_workload_mask_adjustments.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  return false;
+}
+
+void IdleCoreWorkerMain(void* arg) {
+  auto& worker = *static_cast<IdleCoreWorker*>(arg);
+  const u32 bit = 1u << worker.core;
+  const Result pin_rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, static_cast<s32>(worker.core), bit);
+  worker.pin_result.store(static_cast<u32>(pin_rc), std::memory_order_relaxed);
+  u64 previous_idle = 0;
+  u64 previous_tick = 0;
+  bool have_previous = false;
+  u32 seen_seq = 0;
+  for (;;) {
+    u32 seq = worker.request_seq.load(std::memory_order_acquire);
+    while (seq == seen_seq) {
+      const Result wait_rc = svcWaitForAddress(&worker.request_seq, ArbitrationType_WaitIfEqual,
+                                               seen_seq, -1);
+      if (R_FAILED(wait_rc)) {
+        // Keep the diagnostic thread harmless if address arbitration is unavailable on this Horizon build.
+        __real_svcSleepThread(100000000ULL);
+      }
+      seq = worker.request_seq.load(std::memory_order_acquire);
+    }
+    seen_seq = seq;
+    const u64 before = armGetSystemTick();
+    u64 idle = 0;
+    const Result info_rc = svcGetInfo(&idle, InfoType_IdleTickCount, INVALID_HANDLE, UINT64_MAX);
+    const u64 after = armGetSystemTick();
+    const u64 sample_tick = before + (after - before) / 2;
+    const u32 observed = svcGetCurrentProcessorNumber();
+    worker.observed_core.store(observed, std::memory_order_relaxed);
+    worker.info_result.store(static_cast<u32>(info_rc), std::memory_order_relaxed);
+    worker.sample_tick.store(sample_tick, std::memory_order_relaxed);
+    const bool on_expected_core = observed == worker.core && R_SUCCEEDED(pin_rc);
+    if (R_SUCCEEDED(info_rc) && on_expected_core && have_previous && sample_tick > previous_tick &&
+        idle >= previous_idle) {
+      const u64 elapsed = sample_tick - previous_tick;
+      const u64 idle_ticks = idle - previous_idle;
+      const double idle_share = std::min(1.0, double(idle_ticks) / double(elapsed));
+      const u32 busy = static_cast<u32>((1.0 - idle_share) * 1000.0 + 0.5);
+      worker.interval_ticks.store(elapsed, std::memory_order_relaxed);
+      worker.idle_delta.store(idle_ticks, std::memory_order_relaxed);
+      worker.busy_permille.store(std::min<u32>(busy, 1000), std::memory_order_relaxed);
+      worker.valid.store(true, std::memory_order_relaxed);
+    } else {
+      worker.valid.store(false, std::memory_order_relaxed);
+    }
+    if (R_SUCCEEDED(info_rc) && on_expected_core) {
+      previous_idle = idle;
+      previous_tick = sample_tick;
+      have_previous = true;
+    }
+    worker.complete_seq.store(seq, std::memory_order_release);
+    svcSignalToAddress(&worker.complete_seq, SignalType_Signal, 0, 1);
+  }
+}
+
+void StartIdleCoreWorkers() {
+  for (u32 core = 0; core < 4; ++core) {
+    IdleCoreWorker& worker = g_idle_workers[core];
+    worker.core = core;
+    Result rc = __real_threadCreate(&worker.thread, IdleCoreWorkerMain, &worker, nullptr, 0x4000, 0x2C,
+                                    static_cast<int>(core));
+    if (R_FAILED(rc)) {
+      worker.pin_result.store(static_cast<u32>(rc), std::memory_order_relaxed);
+      continue;
+    }
+    rc = threadStart(&worker.thread);
+    if (R_FAILED(rc)) {
+      threadClose(&worker.thread);
+      worker.pin_result.store(static_cast<u32>(rc), std::memory_order_relaxed);
+      continue;
+    }
+    worker.active.store(true, std::memory_order_release);
+  }
+}
+
+void ReadIdleCoreWorkers(FILE* f, u64 tick_freq) {
+  const u32 seq = g_idle_request_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+  for (auto& worker : g_idle_workers) {
+    if (!worker.active.load(std::memory_order_acquire)) continue;
+    worker.request_seq.store(seq, std::memory_order_release);
+    const Result signal_rc = svcSignalToAddress(&worker.request_seq, SignalType_Signal, 0, 1);
+    worker.signal_result.store(static_cast<u32>(signal_rc), std::memory_order_relaxed);
+  }
+  // A helper can be delayed by a higher-priority system thread. Do not hold up the game report indefinitely;
+  // its next sample still uses the real elapsed ticks, and an old result is marked stale below.
+  const u64 deadline = armGetSystemTick() + armNsToTicks(kIdleReportWaitNs);
+  for (auto& worker : g_idle_workers) {
+    if (!worker.active.load(std::memory_order_acquire)) continue;
+    while (worker.complete_seq.load(std::memory_order_acquire) < seq) {
+      const u64 now = armGetSystemTick();
+      if (now >= deadline) break;
+      const u64 timeout_ns = armTicksToNs(deadline - now);
+      const Result wait_rc = svcWaitForAddress(&worker.complete_seq, ArbitrationType_WaitIfLessThan,
+                                               seq, static_cast<s64>(timeout_ns));
+      if (R_FAILED(wait_rc)) break;
+    }
+  }
+  const u64 now = armGetSystemTick();
+  for (const auto& worker : g_idle_workers) {
+    if (!worker.active.load(std::memory_order_acquire)) {
+      std::fprintf(f, "     core %u idle: unavailable (setup result 0x%08X)\n", worker.core,
+                   worker.pin_result.load(std::memory_order_relaxed));
+      continue;
+    }
+    const u32 result = worker.info_result.load(std::memory_order_relaxed);
+    const u32 observed = worker.observed_core.load(std::memory_order_relaxed);
+    const u64 sample_tick = worker.sample_tick.load(std::memory_order_relaxed);
+    const double age = sample_tick && now >= sample_tick ? double(now - sample_tick) / double(tick_freq) : 0.0;
+    const u64 interval = worker.interval_ticks.load(std::memory_order_relaxed);
+    const bool fresh = worker.complete_seq.load(std::memory_order_acquire) >= seq;
+    if (R_FAILED(static_cast<Result>(result)) || !worker.valid.load(std::memory_order_relaxed)) {
+      std::fprintf(f, "     core %u idle: warming up/unavailable (pin 0x%08X, query 0x%08X, ran on %u, %s)\n",
+                   worker.core, worker.pin_result.load(std::memory_order_relaxed), result, observed,
+                   fresh ? "fresh" : "stale");
+      continue;
+    }
+    std::fprintf(f,
+                 "     core %u system busy %.1f%% over %.2f s (idle ticks %llu, read age %.3f s, "
+                 "ran on %u, pin 0x%08X, query 0x%08X, request signal 0x%08X, %s)\n",
+                 worker.core, double(worker.busy_permille.load(std::memory_order_relaxed)) / 10.0,
+                 double(interval) / double(tick_freq),
+                 static_cast<unsigned long long>(worker.idle_delta.load(std::memory_order_relaxed)), age, observed,
+                 worker.pin_result.load(std::memory_order_relaxed), result,
+                 worker.signal_result.load(std::memory_order_relaxed), fresh ? "fresh" : "stale");
+  }
+}
+
+void ApplyWorkloadCoreMask(FILE* f) {
+  if (WorkloadCoreMask() != 0x7) return;
+  u32 changed = g_workload_mask_adjustments.exchange(0, std::memory_order_relaxed);
+  for (const auto& slot : g_slots) {
+    const Handle handle = slot.handle.load(std::memory_order_relaxed);
+    if (handle && ApplyWorkloadMaskToThread(handle)) ++changed;
+  }
+  // The profiler was created with __real_threadCreate, so it is intentionally not in the game-thread registry.
+  if (g_thread.handle && ApplyWorkloadMaskToThread(g_thread.handle)) ++changed;
+  std::fprintf(f, "-- workload core mask 0x7: adjusted %u thread mask(s); core-3 idle helper remains pinned\n", changed);
+}
+
+void InitializeWorkloadCoreMask() {
+  const int requested = RexSwitchPerfWorkloadCoreMask ? RexSwitchPerfWorkloadCoreMask() : 0xF;
+  g_workload_core_mask.store(requested == 0x7 ? 0x7 : 0xF, std::memory_order_relaxed);
+}
 
 void Register(Handle h) {
   if (!h) {
@@ -599,25 +802,32 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
   }
   const long report_start = ReportStart(f);
 
+  ApplyWorkloadCoreMask(f);
+  ReadIdleCoreWorkers(f, tick_freq);
   ApplyExclusiveCore(f, order);
 
   u64 lim_used = 0, lim_cap = 0, proc_used = 0, proc_total = 0;
   LimitOfMapping(&lim_used, &lim_cap, &proc_used, &proc_total);
   u64 heap_in_use = 0, heap_free = 0, heap_untouched = 0;
   HeapState(&heap_in_use, &heap_free, &heap_untouched);
+  u64 process_core_mask = 0;
+  const Result process_mask_rc = svcGetInfo(&process_core_mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
 
   double total_cpu = 0.0;
   for (size_t i : order) {
     total_cpu += g_slots[i].cpu;
   }
   std::fprintf(f,
-               "==== %.1f s | mode: %s | game %.1f fps | CPU total %.0f%% (400%% = 4 cores) | faults/s: "
+               "==== %.1f s | mode: %s | workload mask 0x%X | process permission 0x%llX (rc 0x%08X) | "
+               "game %.1f fps | CPU total %.0f%% "
+               "(400%% = 4 cores) | faults/s: "
                "emulated read %.0f, SDK handler %.0f, emulated retry %.0f, SEH %.0f, "
                "physical committed %.0f, views %.0f | guest %zu/%zu MB (backing/mapped) | "
                "mapping limit %llu/%llu MB, process %llu/%llu MB, heap: malloc in use %llu MB, free in arena "
                "%llu MB, never taken %llu MB | "
                "samples %zu | watching: %s | samplers: %.0f new/s, %.0f stalls/s\n",
-               seconds, mode, double(counters_now[0] - counters_last[0]) / seconds, total_cpu,
+               seconds, mode, WorkloadCoreMask(), static_cast<unsigned long long>(process_core_mask),
+               static_cast<u32>(process_mask_rc), double(counters_now[0] - counters_last[0]) / seconds, total_cpu,
                double(counters_now[1] - counters_last[1]) / seconds,
                double(counters_now[2] - counters_last[2]) / seconds,
                double(counters_now[3] - counters_last[3]) / seconds,
@@ -634,9 +844,12 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                 double(counters_now[19] - counters_last[19]) / seconds);
   {
     char label[kLabelBytes];
+    char condition[kABConditionBytes];
     ReadLabel(label);
+    ReadABCondition(condition);
     const uint32_t block = g_report_index.fetch_add(1, std::memory_order_relaxed) + 1;
-    std::fprintf(f, "     block %u | label: %s\n", block, label[0] ? label : "-");
+    std::fprintf(f, "     block %u | label: %s | A/B condition: %s\n", block, label[0] ? label : "-",
+                 condition[0] ? condition : "-");
   }
   // How the guest window is mapped: 4 KB pages or 2 MB blocks (guest_memory_large_pages). See
   // docs/platform-notes.md, "Guest memory page size".
@@ -810,9 +1023,16 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
 
   // What each thread was doing during the long frames of this interval.
   {
-    const u32 nt = std::min<u32>(g_num_hitches.exchange(0), kMaxHitches);
+    WindowHitch hitches[kMaxHitches];
+    u32 nt = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_hitches_mutex);
+      nt = std::min<u32>(g_num_hitches, kMaxHitches);
+      std::memcpy(hitches, g_hitches, nt * sizeof(WindowHitch));
+      g_num_hitches = 0;
+    }
     if (nt && !samples.empty()) {
-      std::vector<WindowHitch> v(g_hitches, g_hitches + nt);
+      std::vector<WindowHitch> v(hitches, hitches + nt);
       std::sort(v.begin(), v.end(), [](const WindowHitch& a, const WindowHitch& b) { return a.start < b.start; });
       double ms_total = 0.0;
       for (const WindowHitch& w : v) {
@@ -822,7 +1042,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
         auto it = std::upper_bound(v.begin(), v.end(), t, [](u64 x, const WindowHitch& w) { return x < w.start; });
         return it != v.begin() && t <= (it - 1)->end;
       };
-      std::fprintf(f, "\n== during the hitches: %u frames over 45 ms (%.0f ms in total) ==\n", nt, ms_total);
+      std::fprintf(f, "\n== during the hitches: %u frames over 100 ms (%.0f ms in total) ==\n", nt, ms_total);
       for (size_t i : order) {
         std::vector<u64> pcs;
         std::vector<const Sample*> all;
@@ -1113,6 +1333,8 @@ void ProfilerMain(void*) {
     overlay.Step(armGetSystemTick(), tick_freq, false);
   }
 
+  InitializeWorkloadCoreMask();
+
   // Invasive sampling is only enabled explicitly, for diagnostics.
   // The normal mode keeps FPS, CPU and counters, without stopping the game.
   bool sample_stacks = false;
@@ -1132,6 +1354,8 @@ void ProfilerMain(void*) {
     std::fprintf(f, "image 0x%016" PRIx64 ", code up to 0x%016" PRIx64 "\n\n", g_base,
                  g_text_hi);
     std::fprintf(f, "Stack sampling: %s\n", sample_stacks ? "active (1 ms)" : "disabled");
+    std::fprintf(f, "Core A/B workload mask: 0x%X (process permission must remain 0xF)\n\n",
+                 WorkloadCoreMask());
     FinishReport(f, 0);
   }
 
@@ -1223,6 +1447,7 @@ __attribute__((constructor(102))) void StartProfiler() {
   }
   Register(envGetMainThreadHandle());
   std::strncpy(g_slots[0].name, "main (UI)", sizeof(g_slots[0].name) - 1);
+  StartIdleCoreWorkers();
   // 0x2A: above everything in the game (audio runs at 0x2B), so the samples
   // are taken on time. It sleeps almost all the time.
   if (R_SUCCEEDED(__real_threadCreate(&g_thread, ProfilerMain, nullptr, nullptr, 0x10000, 0x2A,
@@ -1240,6 +1465,7 @@ Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_m
   const Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
   if (R_SUCCEEDED(rc) && t) {
     Register(t->handle);
+    ApplyWorkloadMaskToThread(t->handle);
   }
   return rc;
 }
@@ -1575,11 +1801,12 @@ void __wrap_svcSleepThread(s64 nano) {
  * shadow, 4 = SEH. 28..32 = draws per surface width from IssueDraw
  * (1600 or more, 1280-1599, 640-1279, 256-639, under 256).
  */
-// A long frame, in armGetSystemTick ticks (see WindowHitch).
+// A long frame, in armGetSystemTick ticks (see WindowHitch). The renderer calls this only for frames
+// over 100 ms, excluding the normal ~50 ms cadence at the game's 20 FPS cap.
 void RexSwitchPerfHitch(u64 start, u64 end) {
-  const u32 i = g_num_hitches.fetch_add(1);
-  if (i < kMaxHitches) {
-    g_hitches[i] = {start, end};
+  std::lock_guard<std::mutex> lock(g_hitches_mutex);
+  if (g_num_hitches < kMaxHitches) {
+    g_hitches[g_num_hitches++] = {start, end};
   }
 }
 
@@ -1604,6 +1831,15 @@ void RexSwitchPerfSetLabel(const char* label) {
   std::strncpy(dst, label ? label : "", kLabelBytes - 1);
   dst[kLabelBytes - 1] = 0;
   g_label_seq.store(seq, std::memory_order_release);
+}
+
+// The A/B condition is printed with every profiler block without replacing the scene/location label.
+extern "C" void RexSwitchPerfSetABCondition(const char* condition) {
+  const uint32_t seq = g_ab_condition_seq.load(std::memory_order_relaxed) + 1;
+  char* dst = g_ab_conditions[seq & 1];
+  std::strncpy(dst, condition ? condition : "", kABConditionBytes - 1);
+  dst[kABConditionBytes - 1] = 0;
+  g_ab_condition_seq.store(seq, std::memory_order_release);
 }
 
 // Report blocks written so far (the block being measured now is this + 1).

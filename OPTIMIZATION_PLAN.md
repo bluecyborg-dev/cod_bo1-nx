@@ -29,109 +29,124 @@ Rules for every step (from nfsmw-nx and masseffect-nx `measuring.md`):
 
 ## Checklist
 
-### Next
+### Recommended next steps (reordered 2026-10-17)
 
-**Candidates from the Prototype ports (recorded 2026-10-17).** From fungalspores/prototype-switch and
-penettrator/prototype2-nx (same stack as ours; details in `docs/OTHER_PORTS_RESEARCH.md`, fifth pass, and nx-port-guide
-`08-prior-port-research-database.md`). In order of expected value:
+Ranked by expected gain per effort against the console evidence. These are candidates, not promised gains. Keep each
+console comparison to one setting change, the same scene and logging, and report frame-time tails as well as FPS. Use
+stock clocks unless the item explicitly tests an overclock interaction. The stock-clock fourth-core comparison was
+inconclusive; the user has requested a separate overclocked retest.
 
-1. [ ] **Fourth CPU core: access is verified; controlled A/B and tuning remain.** The previous HBL process permission
-   allowed cores 0-2; those three ran at 240-298 % of 300 %.
-   - [x] **Decision (user, 2026-10-17): patch the existing `atmosphere/hbl.nsp`**, replacing the earlier NSP-forwarder
-     decision so the Sphaira/NetLoader + nxlink loop stays unchanged. Preserve the original HBL backup; do not commit
-     or publish the NSP.
-   - [x] Patch and launch Sphaira, send the permission probe, and confirm console output `process core mask: 0xF`,
-     `observed cpu: 3`, core-3 execution PASS.
-   - [x] Send BO1 with profiling enabled. Its process and major game/native thread masks are `0xF`. User's Kino
-     playtest felt better overall: stable/smooth gameplay, one minor loading-screen stutter, and two freezes estimated
-     at about one second each. See `docs/OPTIMIZATION_LOG.md` for the profiler interval and its limits.
-   - [x] Add stack sampling and collect a Kino map-stage profile. The pinned core-3 tick probe returned 300 per-core
-     ticks against 3,467,008 total ticks. Atmosphère's kernel source confirms that retail per-core thread accounting
-     is not implemented, so the per-core split was removed from the profiler; see `docs/OPTIMIZATION_LOG.md`.
-   - [ ] Compare matched Kino runs with HBL core permission capped at core 2 versus core 3, holding the BO1 build,
-     settings and play sequence constant. Use total/thread CPU, frame timing, hitch counts and the user's experience
-     to judge the permission change. A mask of `0xF` grants access; it does not show where BO1 actually ran. Keep
-     core 3 shared with system services. The current profile points to renderer hashing/comparison work as the first
-     low-risk optimization candidate; see `docs/OPTIMIZATION_LOG.md`. For both runs, launch with
-     `--bo1_debug_exec=devmap+zombie_theater --bo1_profile_log=true --bo1_profile_stacks=true` so the map load and
-     CPU profile are repeatable. The 2026-10-17 19:49 run omitted these args; it supplies renderer timings only and
-     does not count as the matched comparison.
-2. [ ] **Hash less in the renderer.** Hashing, compares and copies are ~40 % of our ring thread. A profiled Kino run
-   collected per-frame texture/vertex-index hash bytes and geometry-hash/vertex-copy time; the diagnostic counters do
-   not change cache decisions. The initial experiment is an opt-in 16-frame full-hash cadence for trusted geometry,
-   with an exact per-frame geometry mode for correctness comparisons. Prototype 2's renderer copies buffers
-   that change every frame without hashing them first, checks settled ranges of 16 KB or more by samples plus a full
-   hash every 16 frames, hashes small settled ranges every 4th frame, and gives pages a CPU routine just wrote a new
-   identity. The new setting leaves our existing change detection unchanged by default; the console comparison is
-   still pending. A candidate run with `--bo1_native_geometry_hash_every_16=true --bo1_native_hash_counters=true`
-   is logged, but the user observed FPS falling after a few minutes and the run does not establish a win. The first
-   cadence-off control enabled 1 kHz stack sampling; the user found it much less stable, and the capture showed long
-   gaps with the GPU idle. Since sampling briefly pauses threads, repeat the default cadence-off Kino run with stack
-   sampling disabled before comparing cadence on/off. Keep `--bo1_native_geometry_hash_exact=true` for a separate
-   correctness comparison because a change can be seen frames late.
-3. [ ] **`bo1_native_depth24` A/B** (exists, off, never tested on the console; launch option only): depth at 32 bits
-   per pixel instead of D32F_S8, which NVIDIA keeps at 64. The scene depth is `kD24FS8`; check BO1's stencil use
-   first. Prototype 2 ships the equivalent on.
-4. [ ] **Main XThread at priority 0x3A** instead of 0x3B beside the JQ workers and Backend (Prototype 2's main loop got
-   ~70 % of a core before). Risk: its job-wait loop yields, and a yield does not give way to the 0x3B threads, so it
-   could starve them on its core; test with the job throttle in place.
-5. [ ] **PGO trained on the console.** The instrumented build dumps and resets the gcov counters to `sdmc:/pgo` every
-   3 minutes (the game is closed with HOME, so they never flush at exit); `-fno-profile-values`, same GCC and build
-   layout for GEN and USE; never benchmark the instrumented build. Then rebuild with the profiles. LTO on top needs
-   more RAM than this Mac's Docker has.
+1. [ ] **Deferred by user: `bo1_fx_lite` A/B in an effect-heavy Kino scene.** Keep the preset off for now; revisit
+   only if we can compare a repeatable effect-heavy segment. The first toggle smoke pass lacked tagged profiler
+   reports. A follow-up OFF → ON → OFF pass captured 9/13/9 complete reports, but draw counts and load varied
+   substantially and the phase averages showed no gain (details in `docs/OPTIMIZATION_LOG.md`). This existing preset
+   enables effect/element culling, disables cloud effects, and lowers `ai_corpseCount` to 3. Long frames were
+   associated with about 1,370 draws versus about 860 in ordinary frames, without shader or pipeline creation; this
+   is the most direct low-effort candidate for reducing CPU and GPU work in zombie/effect bursts. It may remove
+   visible effects and corpses. Launch with `--bo1_profile_log=true` so the 10 s tagged reports reach the Wi-Fi log.
+   Use the settings overlay (`L+R+Right`), category **BO1 A/B**, to switch it live in the same scene.
+   Switch state after a profiler report, ignore the first block after each change because it can include both states,
+   and collect at least three complete blocks per phase. An OFF → ON → OFF pass helps expose round-to-round drift.
+   The profiler prints `A/B condition: bo1_fx_lite=ON/OFF`; transition logs
+   record when the change's dvar batch was queued. The earlier console attempt lost its log because a stale listener
+   blocked output; the launch script now stops stale listeners. Separate the dvars later only if the preset helps and
+   we need to identify which one matters.
+2. [x] **MSAA-off console attempt parked after a visual regression.** On 2026-10-18, the user reported a large black
+   box over the main menu after launching with `bo1_native_msaa=false`. The log confirms 1x targets but identifies no
+   specific renderer error; there is no gameplay performance result. Keep the normal 2x setting and revisit only
+   after investigating the black-box artifact.
+3. [x] **Overclocked Kino diagnostic captured (2026-10-18).** The archived build ran 90 ten-second map-stage reports
+   with `--bo1_profile_log=true --bo1_native_hash_counters=true`; see `out/net_logs/20261018-023901.log` and the
+   detailed result in `docs/OPTIMIZATION_LOG.md`. The clock and temperature readings stayed steady, and the measured
+   hash/copy work was modest on average. The log also records nine post-load pauses of 1.7–2.6 s, almost entirely
+   renderer-ring idle. This was an overclock diagnostic, not a stock-clock comparison, and stack sampling was off.
+4. [ ] **Short stack diagnostic for long frames.** The overclocked log confirmed that the previous run launched with
+   stack sampling disabled. It also exposed an unconnected profiler hook: the native renderer never marked long-frame
+   intervals, so the profiler could not filter samples into the "during the hitches" section. The next build records
+   frames over 100 ms and associates those windows with stack samples. Capture a short Kino segment with
+   `--bo1_profile_log=true --bo1_profile_stacks=true`. This is diagnostic only: 1 kHz sampling pauses threads and
+   can perturb pacing, so do not use it to judge performance.
+5. [ ] **Overclocked fourth-core workload-mask A/B.** The user reopened core-3 testing after the overclock capture.
+   Keep the same overclock settings and scene, then compare the same NRO with
+   `--bo1_profile_workload_core_mask=7` and `=15`, plus `--bo1_profile_log=true`; leave stack sampling off for this
+   performance comparison. Process permission stays `0xF`; only tracked workload threads are restricted in the `0x7`
+   leg. Allow the map to settle and collect at least three complete 10 s reports per leg. Compare FPS, process CPU,
+   frames over 100 ms, per-core system-busy readings, and the reported effective clocks. This tests whether the fourth
+   core helps at the elevated clocks; it cannot repair Atmosphère's unsupported per-core `ThreadTickCount` accounting.
+6. [ ] **Target the measured renderer CPU cost if it remains limiting.** Earlier console samples put hashing,
+   compares, and copies at about 40% of renderer busy samples. The new counters show where those costs land per frame,
+   but not their callers. After the stall source is understood, capture pc/lr callers and optimize the largest verified
+   renderer cost; add per-stage timers and requested-versus-emitted state counters if call sites remain unclear. The
+   geometry-hash cadence A/B did not show a gain, so do not repeat cadence changes without new evidence.
+7. [ ] **Main XThread priority A/B (`0x3B` → `0x3A`) only if profiling shows the game main thread is limiting.** It
+   could give the main thread more CPU, but its yielding job-wait loop may starve same-core `0x3B` workers. Keep the
+   worker throttle enabled and check input latency, frame tails, and worker progress.
+8. [ ] **Console-trained PGO after a repeatable route is established.** Instrumented builds dump/reset gcov counters
+   to `sdmc:/pgo` every three minutes; rebuild with the same GCC and layout, and never benchmark the instrumented
+   binary. PGO could improve hot guest/native code broadly, but needs a capture session and release rebuild. Add LTO
+   only when Docker has enough memory.
 
-Still pending from the last sessions: `bo1_fx_lite` (effect culling dvars) on the console, with the Wi-Fi log working.
+### Completed or parked experiments
 
-- [ ] **Console CPU profile in Kino** (SDK stack sampler: `--bo1_profile_stacks=true --bo1_profile_log=true` sends
-  each 10 s report to the Wi-Fi log, no flag file on the SD card needed): which guest
-  thread and function holds the heavy moments with shadows off (125-147 swaps per 10 s with the renderer idle) and
-  the 0.8 s hitch. Check the corpse theory, streaming I/O and kernel waits.
+- [x] **Stock-clock fourth-core access and workload-mask A/B.** The process can run on core 3, but matched `0x7`/`0xF`
+  runs showed no clear average gameplay gain. The user later reopened the question specifically at overclocked clocks;
+  see the new A/B above. Wake-core histograms and affinity tuning remain deferred unless the overclocked comparison
+  shows a gain. Full helper validation and stock-clock results are in `docs/OPTIMIZATION_LOG.md`.
+- [x] **Geometry-hash cadence A/B.** No clear gain; leave the 16-frame setting off. Exact-hash follow-up is deferred.
+- [x] **`bo1_native_depth24` A/B.** No clear gain and user saw more light flickering; leave it off.
+- [x] **Depth-prepass skip and ZCULL.** Prepass skip raised GPU time from 36 to 42 ms/frame. ZCULL showed no
+  measurable gain and had reported stutters/input behavior; both stay off. Revisit ZCULL only with a same-session A/B.
 
 ### Later (noted, not now)
 
 - [ ] **`min` closer to `off`**: with the shadow system on, the game still builds ~2,900 shadow-map caster draws per
   frame that `min` discards (Mac: 905k draws per 10 s vs 326k with `off`, 580k skipped). Shrink the sun shadow range
   (`sm_sunShadowScale` < 0.25, `sm_sunSampleSizeNear` < 0.25) so they are not generated.
-- [ ] **In-session A/B switch** (user: not a priority, the logs are enough for now): a button combo that flips the setting under test (like − + D-pad for shadows), with
-  the log marking each 10 s window A or B, so one session in the same spot compares both instead of separate sessions
-  in different rounds.
-- [ ] **Hounds round** (first reached 2026-10-16): 124-175 swaps per 10 s, ~1,000-1,800 draws per frame (the hounds'
-  fire, lightning and spawn effects), renderer CPU up to 51 ms and GPU up to 39 ms. Options: fewer effect draws through
-  dvars (`fx_cull_effect_spawn` 1, `fx_drawClouds`, `r_glow`, `ai_corpseCount`; docs/deep-research-report-2.md), or the general GPU / renderer work below. The user wants it on the map, nothing done yet.
+- [x] **Live-menu A/B for `bo1_fx_lite`.** Settings overlay (`L+R+Right`) can change the preset during a run; the
+  profiler labels each 10 s report block with the active phase, and the app log records when transition batches
+  queue. This avoids rebuilding/relaunching between FX phases. Other settings need their own live-safety review;
+  MSAA requires restart.
+- [ ] **Hounds round as a stress scene for the prioritized tests.** Earlier runs had 124-175 swaps per 10 s,
+  ~1,000-1,800 draws per frame, renderer CPU up to 51 ms and GPU up to 39 ms. Use it for `bo1_fx_lite` and GPU A/Bs
+  when it is practical to reach; compare the same workload and note visual changes.
 
 ### GPU
 
-- [x] ~~Skip the game's depth prepass~~: tested 2026-10-16, GPU 36 → 42 ms per frame (hidden pixels no longer
-  rejected early) and less smooth; `bo1_native_skip_prepass` now off by default. Maybe worth another try with ZCULL on.
-- [ ] 960x544 internal resolution (16-px tile grid).
+- [x] **MSAA off (`bo1_native_msaa=false`) parked:** the first console launch produced a large black box over the
+  main menu, with no gameplay performance data. Keep 2x MSAA enabled while investigating the visual regression.
+- [ ] One vs two frames in flight: compare throughput and frame tails against input latency (input lag was felt
+  with shadows on; ChatGPT report #5).
 - [ ] 30 FPS cap (2 vblanks) once ~90 % of frames fit in 31 ms.
-- [ ] One vs two frames in flight (input lag felt with shadows on; ChatGPT report #5).
-- [ ] ZCULL: works on the console (NVK gives every depth target a plane with `--bo1_native_zcull=true`), but 2026-10-16 showed no measurable gain and the user felt more stutters, slower textures and ZL acting like taps (cause unknown). Off by default; retry only with the in-session A/B switch.
-- [ ] MSAA off (`bo1_native_msaa=false`, exists): the scene is 2x MSAA at 1040x608; one sample saves much GPU
-  bandwidth, edges get rougher. Console A/B pending.
-- [ ] Fewer passes and barriers (each is a wait for idle on NVK); skip resolves nobody reads.
-- [ ] Depth-only pipelines without a fragment stage.
-- [ ] Count compute dispatches between draws (resolves, conversions): each switch between drawing and compute idles
-  this GPU (Prototype 2 moved its resolves to fragment passes).
+- [ ] Count compute dispatches between draws and inventory passes/barriers/resolves. Then skip unused resolves,
+  reduce unnecessary barriers, or move suitable work to a graphics pass; each draw/compute switch can idle NVK.
+- [ ] Depth-only pipelines without a fragment stage, if captures show meaningful depth-only work.
+- [x] **Depth-prepass skip tested and rejected:** GPU time rose from 36 to 42 ms/frame and gameplay felt less
+  smooth; keep `bo1_native_skip_prepass` off.
+- [x] **ZCULL tested and parked:** it worked, but showed no measurable gain and the user reported more stutters,
+  slower textures, and held ZL acting like taps. Revisit only with a same-session A/B switch.
+- [ ] Resolution reduction is not a ready console A/B: the handheld output is already 1280x720, while BO1 renders
+  its scene at 1040x608. Raising the internal target to 1280x720 would add about 46% more pixels; lowering it could
+  help GPU-bound scenes, but changing dimensions through the PM4 translator requires handling the game's
+  EDRAM-sized render targets. See the correction in `docs/black_ops_switch_performance_research.md`.
 
 ### Renderer thread (CPU per draw)
 
-- [ ] **Hashing, compares and copies are ~40 % of the renderer's busy time** on the console (`XXH3_hashLong` 7.6 %,
-  `memcmp` 7.5 %, `memmove` 7.4 % of its samples). Find the callers with the profiler's new pc/lr pairs (next
-  sampling session), then cut the largest. Vertex uploads are ~1-1.7 MB per frame.
-- [ ] Per-stage stopwatch on the renderer thread (PM4 decode, setup, textures, constants, uploads, Vulkan calls) and
-  counters of requested versus emitted state changes (ChatGPT report #1/#2; Mass Effect's `C6 stages`).
-- [ ] `bo1_native_record_thread` A/B (exists, off): NVK's ~4-5 µs per draw moves to a second thread, as Mass Effect's
-  deferred recording does; it had no free core before the job queue fix.
-- [ ] Back to ~12 µs per draw: sub-allocate texture memory from large blocks; upload only the mip levels a copy
-  changed; create images off the ring.
-- [ ] Render backend polls `WaitForSingleObject` with timeout 0 and yields on every timeout (seen in the Mac profile;
-  confirm on the console first).
+- [ ] Use pc/lr pairs to identify callers behind the known hash/compare/copy cost (~40 % of renderer busy samples:
+  `XXH3_hashLong` 7.6 %, `memcmp` 7.5 %, `memmove` 7.4 %). Cut the largest verified caller; geometry-hash cadence
+  alone did not produce a clear A/B gain. Vertex uploads are ~1-1.7 MB per frame.
+- [ ] If the hottest caller is still unclear, add per-stage renderer timers (PM4 decode, setup, textures, constants,
+  uploads, Vulkan calls) and requested-versus-emitted state counters.
+- [ ] `bo1_native_record_thread` A/B (exists, off): move NVK's ~4-5 µs per draw recording to a worker. Try only
+  after profiling confirms renderer CPU pressure and enough scheduling headroom; verify correctness and frame tails.
+- [ ] Reduce texture allocation/copy work: sub-allocate large blocks, upload only mip levels changed by a copy, and
+  create images off the ring.
+- [ ] Confirm whether the render backend's `WaitForSingleObject` timeout-0 poll/yield loop costs console CPU; it was
+  seen in the Mac profile.
 
 ### Game threads and system
 
-- [ ] Game busy-waits → real waits; thread priorities per thread from the profile (job queue workers busy in
-  `sub_82545308` / `sub_825450A8` on the Mac).
+- [ ] Replace measured game busy-waits with real waits and set thread priorities from the console profile. Job queue
+  workers busy in `sub_82545308` / `sub_825450A8` on the Mac; console behavior decides what to change.
 - [ ] Range cache for the reread streaming archives (`images.pak`, `snd.all.pak`).
 - [ ] `guest_memory_large_pages` A/B (modes 1 and 2).
 - [ ] CPU boost mode during loading screens only.
@@ -147,7 +162,7 @@ Still pending from the last sessions: `bo1_fx_lite` (effect culling dvars) on th
 - [ ] Non-volatile registers as locals / no LR stores (needs shared registers for setjmp/SEH; Prototype 2 found its
   exceptions with masseffect-nx's `read_before_write.py` and marks only those functions `share_registers`).
 - [ ] "Diet" lowerings.
-- [ ] LTO + PGO, hot function ordering (see "Candidates from the Prototype ports" in Next for console PGO).
+- [ ] LTO + PGO and hot function ordering; follow the console PGO capture process in Recommended next steps.
 - [ ] Per-address locks for lwarx/stwcx. regions instead of one process-wide mutex (Prototype); check how our SDK
   serializes reservations.
 - [ ] Native memcpy.
