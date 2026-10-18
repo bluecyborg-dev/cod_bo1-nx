@@ -56,10 +56,14 @@ penettrator/prototype2-nx (same stack as ours; details in `docs/OTHER_PORTS_RESE
      `--bo1_debug_exec=devmap+zombie_theater --bo1_profile_log=true --bo1_profile_stacks=true` so the map load and
      CPU profile are repeatable. The 2026-10-17 19:49 run omitted these args; it supplies renderer timings only and
      does not count as the matched comparison.
-2. [ ] **Hash less in the renderer.** Hashing, compares and copies are ~40 % of our ring thread. Prototype 2's
-   renderer copies buffers that change every frame without hashing them first, checks settled ranges of 16 KB or more
-   by samples plus a full hash every 16 frames, hashes small settled ranges every 4th frame, and gives pages a CPU
-   routine just wrote a new identity. Keep an exact-check switch (a change can be seen frames late).
+2. [ ] **Hash less in the renderer.** Hashing, compares and copies are ~40 % of our ring thread. First collect
+   exact per-frame texture/vertex-index bytes hashed, geometry-hash time, and whole/ranged vertex-copy cost; the
+   diagnostic counters do not change cache decisions, and their timers are enabled with
+   `--bo1_native_hash_counters=true`. Then use a profiled Kino run to choose the first safe reduction and retain an
+   exact-check mode for correctness comparisons. Prototype 2's renderer copies buffers
+   that change every frame without hashing them first, checks settled ranges of 16 KB or more by samples plus a full
+   hash every 16 frames, hashes small settled ranges every 4th frame, and gives pages a CPU routine just wrote a new
+   identity. Keep an exact-check switch (a change can be seen frames late).
 3. [ ] **`bo1_native_depth24` A/B** (exists, off, never tested on the console; launch option only): depth at 32 bits
    per pixel instead of D32F_S8, which NVIDIA keeps at 64. The scene depth is `kD24FS8`; check BO1's stencil use
    first. Prototype 2 ships the equivalent on.

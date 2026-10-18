@@ -278,3 +278,26 @@ What is new for us, roughly by expected value:
 
 Their other settings match ours in spirit: MSAA off, recording thread on, pipeline prewarm, async pipelines, a
 depth-prepass skip (LESS/LEQUAL, theirs) and per-pass GPU profiling.
+
+## Sixth pass (2026-10-17): decompilation and recompilation examples for Switch ports
+
+Primary project sources reviewed: [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) and its
+[Switch build instructions](https://github.com/HarbourMasters/Shipwright/blob/develop/docs/BUILDING.md),
+[zeldaret/oot](https://github.com/zeldaret/oot), and
+[Zelda 64: Recompiled](https://github.com/Zelda64Recomp/Zelda64Recomp).
+
+- **A decompilation is not automatically a port.** `zeldaret/oot` reconstructs source from the original game with
+  static/dynamic analysis and explicitly says that it is not producing a PC port. It is useful for game logic,
+  data structures, and behavior, but platform integration still has to be supplied.
+- **Ship of Harkinian is a useful source-port example.** It depends on the OoT decompilation and `libultraship`,
+  extracts game assets into a portable OTR format, and has a Switch CMake target that produces an NRO with the
+  devkitPro Switch toolchain. This shows how a source-based project separates game code/assets from platform
+  rendering, input, storage, and packaging.
+- **Static recompilation is a different route.** Zelda 64: Recompiled translates the N64 program to native code
+  without using the decompiled source as its base, while its README credits decompilation research as useful for
+  enhancements. It is a useful comparison for translation and patching, but it targets PC rather than Switch.
+
+For BO1, the most transferable implementation references remain open-source Xbox 360 recompilations using the
+ReXGlue/Horizon/NVK stack, such as Prototype 2. A Switch-native decompilation can teach Horizon-facing code, but it
+cannot by itself show how to translate Xenos GPU behavior or Xbox 360 threading. Use source/build architecture and
+public measurements as references; keep copyrighted game code and assets out of this repository.

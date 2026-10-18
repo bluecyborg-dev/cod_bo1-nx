@@ -664,6 +664,15 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
                   double(s.texture_create_ns - reported_render_.texture_create_ns) / 1e6 / double(frames),
                   double(s.memexport_copies - reported_render_.memexport_copies) / double(frames),
                   double(s.memexport_ns - reported_render_.memexport_ns) / 1e6 / double(frames));
+      constexpr double kMiB = 1024.0 * 1024.0;
+      REXLOG_INFO("[native] per frame: texture hash {:.2f} MiB, vertex/index hash {:.2f} MiB / {:.2f} ms; "
+                  "vertex stream copies {:.2f} MiB / {:.2f} ms ({:.2f} MiB whole-buffer)",
+                  double(s.texture_hash_bytes - reported_render_.texture_hash_bytes) / kMiB / double(frames),
+                  double(s.geometry_hash_bytes - reported_render_.geometry_hash_bytes) / kMiB / double(frames),
+                  double(s.geometry_hash_ns - reported_render_.geometry_hash_ns) / 1e6 / double(frames),
+                  double(s.vertex_bytes_copied - reported_render_.vertex_bytes_copied) / kMiB / double(frames),
+                  double(s.vertex_copy_ns - reported_render_.vertex_copy_ns) / 1e6 / double(frames),
+                  double(s.vertex_bytes_whole - reported_render_.vertex_bytes_whole) / kMiB / double(frames));
       REXLOG_INFO("[native] per frame: {:.1f} waits for the game, {:.1f} ms waiting",
                   double(waits_ - reported_waits_) / double(frames),
                   double(wait_ns_ - reported_wait_ns_) / 1e6 / double(frames));

@@ -69,7 +69,9 @@ class ChangeDetector {
       if (unchanged_ < trusted_checks) {
         ++unchanged_;
       }
-      bytes_hashed += kSamples * kSampleBytes;
+      // Small ranges are fully hashed by Sample(); larger ranges read the
+      // eight disjoint sample windows.
+      bytes_hashed += size <= kSamples * kSampleBytes * 2 ? size : kSamples * kSampleBytes;
       return hash_;
     }
     uint64_t hash = XXH3_64bits(data, size);

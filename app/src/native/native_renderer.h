@@ -57,9 +57,13 @@ struct RendererStats {
   uint64_t texture_memory_bytes = 0;  // bo1-nx
   uint64_t texture_budget_evictions = 0;  // bo1-nx
   uint64_t texture_placeholders = 0;  // bo1-nx
-  uint64_t texture_hash_ns = 0, texture_create_ns = 0, texture_creates = 0;  // bo1-nx
+  uint64_t texture_hash_ns = 0, texture_hash_bytes = 0;  // bo1-nx
+  uint64_t texture_create_ns = 0, texture_creates = 0;  // bo1-nx
   uint64_t textures_replaced = 0;
   uint64_t vertex_bytes_copied = 0;
+  uint64_t vertex_bytes_whole = 0;  // bo1-nx: copied by shaders whose fetch ranges are unsafe
+  uint64_t geometry_hash_ns = 0, geometry_hash_bytes = 0;  // bo1-nx: vertex and index data
+  uint64_t vertex_copy_ns = 0;  // bo1-nx: time in vertex stream memcpy calls
   uint64_t render_passes = 0;
   uint64_t submissions = 0;
   // Renderer CPU time on the ring thread (draws, resolves, swaps), and GPU

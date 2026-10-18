@@ -120,6 +120,8 @@ REXCVAR_DEFINE_BOOL(bo1_native_memexport_copy, true, "BO1",
 REXCVAR_DEFINE_BOOL(bo1_native_ranged_vertices, true, "BO1",
                     "Native renderer: copy only the vertices a draw reads (its index range) when the vertex "
                     "shader fetches by vertex index, instead of whole vertex buffers");
+REXCVAR_DEFINE_BOOL(bo1_native_hash_counters, false, "BO1",
+                    "Diagnostics: time vertex/index data hashing and vertex stream copies");
 REXCVAR_DEFINE_BOOL(bo1_native_depth24, false, "BO1",
                     "Store depth in 32 bits per pixel (24-bit depth with stencil, or float "
                     "without) instead of 32-bit float with stencil, which NVIDIA GPUs keep "
@@ -945,13 +947,18 @@ struct Renderer::Impl {
       known.hash = (frame + 1) * 0xD1B54A32D192ED03ull ^ (uint64_t(address) << 20) ^ bytes;
       return known.hash;
     }
-    uint64_t content = known.detector.Check(data, bytes, frame, address >> 4, vertex_hash_bytes);
+    const bool measure_time = REXCVAR_GET(bo1_native_hash_counters);
+    const uint64_t hash_start = measure_time ? NowNs() : 0;
+    uint64_t content = known.detector.Check(data, bytes, frame, address >> 4, geometry_hash_bytes);
+    if (measure_time) geometry_hash_ns += NowNs() - hash_start;
     known.changes = content != known.content ? std::min(known.changes + 1, 8u) : 0;
     known.content = content;
     known.hash = content;
     return content;
   }
-  uint64_t vertex_hash_bytes = 0;
+  uint64_t geometry_hash_ns = 0;
+  uint64_t geometry_hash_bytes = 0;
+  uint64_t vertex_copy_ns = 0;
   FlatMap64<VertexHash> vertex_hashes;
 
   // Swap.
@@ -4283,7 +4290,10 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
               }
               uint8_t* out = Allocate(len, 16, range_offset);
               if (out && range_offset >= start) {
+                const bool measure_time = REXCVAR_GET(bo1_native_hash_counters);
+                const uint64_t copy_start = measure_time ? NowNs() : 0;
                 std::memcpy(out, source, len);
+                if (measure_time) vertex_copy_ns += NowNs() - copy_start;
                 stats().vertex_bytes_copied += len;
                 AddRange(range_key, stream_head - len);
                 placed = true;
@@ -4325,7 +4335,10 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       } else {
         uint8_t* out = Allocate(bytes, 16, range_offset);
         if (!out) continue;
+        const bool measure_time = REXCVAR_GET(bo1_native_hash_counters);
+        const uint64_t copy_start = measure_time ? NowNs() : 0;
         std::memcpy(out, source, bytes);
+        if (measure_time) vertex_copy_ns += NowNs() - copy_start;
         stats().vertex_bytes_copied += bytes;
         vertex_bytes_whole += bytes;
         AddRange(range_key, stream_head - bytes);
@@ -5418,9 +5431,14 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
   stats().texture_budget_evictions = textures.stats().budget_evictions;
   stats().texture_placeholders = textures.stats().placeholders;
   stats().texture_hash_ns = textures.stats().hash_ns;
+  stats().texture_hash_bytes = textures.stats().hash_bytes;
   stats().texture_create_ns = textures.stats().create_ns;
   stats().texture_creates = textures.stats().creates_on_ring;
   stats().textures_replaced = textures.stats().replaced;
+  stats().geometry_hash_ns = geometry_hash_ns;
+  stats().geometry_hash_bytes = geometry_hash_bytes;
+  stats().vertex_copy_ns = vertex_copy_ns;
+  stats().vertex_bytes_whole = vertex_bytes_whole;
   stats().frame_upload_wait_ns = frame_upload_wait_ns;
   stats().frame_fence_wait_ns = frame_fence_wait_ns;
   stats().frame_drain_wait_ns = frame_drain_wait_ns;
