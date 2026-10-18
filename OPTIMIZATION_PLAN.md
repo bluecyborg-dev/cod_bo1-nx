@@ -31,17 +31,23 @@ Rules for every step (from nfsmw-nx and masseffect-nx `measuring.md`):
 
 ### Next
 
-**Candidates from the Prototype ports (recorded 2026-10-17, none tested yet).** From fungalspores/prototype-switch
-and penettrator/prototype2-nx (same stack as ours; details in `docs/OTHER_PORTS_RESEARCH.md`, fifth pass, and
-nx-port-guide `08-prior-port-research-database.md`). In order of expected value:
+**Candidates from the Prototype ports (recorded 2026-10-17).** From fungalspores/prototype-switch and
+penettrator/prototype2-nx (same stack as ours; details in `docs/OTHER_PORTS_RESEARCH.md`, fifth pass, and nx-port-guide
+`08-prior-port-research-database.md`). In order of expected value:
 
-1. [ ] **Fourth CPU core.** The homebrew loader's NPDM allows cores 0-2; our three run at 240-298 % of 300 %.
-   **Decision (user, 2026-10-17): an NSP forwarder**, not a patched `atmosphere/hbl.nsp`. Build it with
-   Forwarder-Mod (as Prototype 2's `tools/build_forwarder.sh`): `highest_cpu_id` 3 in both NPDM tables (ACID and
-   ACI0), target `sdmc:/switch/bo1-nx/bo1-nx.nro`, our own title ID, built with the user's own `prod.keys` (read
-   locally, never committed or published). Then give the SDK core masks for core 3 (audio/XMA and background threads
-   there; system services also run on it, so it is shared) and A/B against the 3-core launch. Wi-Fi testing still
-   works: the forwarder loads the NRO that nxlink uploads to the same path.
+1. [ ] **Fourth CPU core: access is verified; controlled A/B and tuning remain.** The previous HBL process permission
+   allowed cores 0-2; those three ran at 240-298 % of 300 %.
+   - [x] **Decision (user, 2026-10-17): patch the existing `atmosphere/hbl.nsp`**, replacing the earlier NSP-forwarder
+     decision so the Sphaira/NetLoader + nxlink loop stays unchanged. Preserve the original HBL backup; do not commit
+     or publish the NSP.
+   - [x] Patch and launch Sphaira, send the permission probe, and confirm console output `process core mask: 0xF`,
+     `observed cpu: 3`, core-3 execution PASS.
+   - [x] Send BO1 with profiling enabled. Its process and major game/native thread masks are `0xF`. User's Kino
+     playtest felt better overall: stable/smooth gameplay, one minor loading-screen stutter, and two freezes estimated
+     at about one second each. See `docs/OPTIMIZATION_LOG.md` for the profiler interval and its limits.
+   - [ ] Compare against a matched three-core Kino run, then inspect actual thread scheduling before testing affinity
+     changes. A mask of `0xF` permits core 3; it does not show which core each thread ran on. Keep core 3 shared with
+     system services when evaluating thread placement.
 2. [ ] **Hash less in the renderer.** Hashing, compares and copies are ~40 % of our ring thread. Prototype 2's
    renderer copies buffers that change every frame without hashing them first, checks settled ranges of 16 KB or more
    by samples plus a full hash every 16 frames, hashes small settled ranges every 4th frame, and gives pages a CPU
