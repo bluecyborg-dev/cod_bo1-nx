@@ -45,9 +45,14 @@ penettrator/prototype2-nx (same stack as ours; details in `docs/OTHER_PORTS_RESE
    - [x] Send BO1 with profiling enabled. Its process and major game/native thread masks are `0xF`. User's Kino
      playtest felt better overall: stable/smooth gameplay, one minor loading-screen stutter, and two freezes estimated
      at about one second each. See `docs/OPTIMIZATION_LOG.md` for the profiler interval and its limits.
-   - [ ] Compare against a matched three-core Kino run, then inspect actual thread scheduling before testing affinity
-     changes. A mask of `0xF` permits core 3; it does not show which core each thread ran on. Keep core 3 shared with
-     system services when evaluating thread placement.
+   - [x] Add stack sampling and collect a Kino map-stage profile. The pinned core-3 tick probe returned 300 per-core
+     ticks against 3,467,008 total ticks. Atmosphère's kernel source confirms that retail per-core thread accounting
+     is not implemented, so the per-core split was removed from the profiler; see `docs/OPTIMIZATION_LOG.md`.
+   - [ ] Compare matched Kino runs with HBL core permission capped at core 2 versus core 3, holding the BO1 build,
+     settings and play sequence constant. Use total/thread CPU, frame timing, hitch counts and the user's experience
+     to judge the permission change. A mask of `0xF` grants access; it does not show where BO1 actually ran. Keep
+     core 3 shared with system services. The current profile points to renderer hashing/comparison work as the first
+     low-risk optimization candidate; see `docs/OPTIMIZATION_LOG.md`.
 2. [ ] **Hash less in the renderer.** Hashing, compares and copies are ~40 % of our ring thread. Prototype 2's
    renderer copies buffers that change every frame without hashing them first, checks settled ranges of 16 KB or more
    by samples plus a full hash every 16 frames, hashes small settled ranges every 4th frame, and gives pages a CPU
