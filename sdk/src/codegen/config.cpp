@@ -107,6 +107,8 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             "dform_disp_split");
   MergeBool(cfg.fctiwzInline, toml["fctiwz_inline"].value_or(false), hasBool("fctiwz_inline"),
             "fctiwz_inline");
+  MergeBool(cfg.fpMovesModeless, toml["fp_moves_modeless"].value_or(false), hasBool("fp_moves_modeless"),
+            "fp_moves_modeless");
   MergeBool(cfg.dcbtPrefetch, toml["dcbt_prefetch"].value_or(false), hasBool("dcbt_prefetch"),
             "dcbt_prefetch");
   MergeBool(cfg.skipMsr, toml["skip_msr"].value_or(false), hasBool("skip_msr"), "skip_msr");

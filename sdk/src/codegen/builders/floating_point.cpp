@@ -14,26 +14,32 @@
 
 namespace rex::codegen {
 
+// These operations only copy or change the sign bit; FPCR flush mode cannot affect their result.
+static void emitFloatMoveFlushMode(BuilderContext& ctx) {
+  if (!ctx.config().fpMovesModeless)
+    ctx.emit_set_flush_mode(false);
+}
+
 //=============================================================================
 // Sign Manipulation
 //=============================================================================
 
 bool build_fabs(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFloatMoveFlushMode(ctx);
   ctx.println("\t{}.u64 = {}.u64 & ~0x8000000000000000;", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
 bool build_fnabs(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFloatMoveFlushMode(ctx);
   ctx.println("\t{}.u64 = {}.u64 | 0x8000000000000000;", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
 bool build_fneg(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFloatMoveFlushMode(ctx);
   ctx.println("\t{}.u64 = {}.u64 ^ 0x8000000000000000;", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
@@ -44,7 +50,7 @@ bool build_fneg(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_fmr(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFloatMoveFlushMode(ctx);
   ctx.println("\t{}.f64 = {}.f64;", ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
   return true;
 }

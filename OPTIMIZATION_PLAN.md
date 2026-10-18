@@ -77,7 +77,8 @@ inconclusive; the user has requested a separate overclocked retest.
    compares, and copies at about 40% of renderer busy samples. The new counters show where those costs land per frame,
    but not their callers. After the stall source is understood, capture pc/lr callers and optimize the largest verified
    renderer cost; add per-stage timers and requested-versus-emitted state counters if call sites remain unclear. The
-   geometry-hash cadence A/B did not show a gain, so do not repeat cadence changes without new evidence.
+   geometry-hash cadence A/B did not show a gain on the console or in the Mac follow-up, so do not repeat cadence
+   changes without new evidence.
 7. [ ] **Main XThread priority A/B (`0x3B` → `0x3A`) only if profiling shows the game main thread is limiting.** It
    could give the main thread more CPU, but its yielding job-wait loop may starve same-core `0x3B` workers. Keep the
    worker throttle enabled and check input latency, frame tails, and worker progress.
@@ -116,7 +117,8 @@ inconclusive; the user has requested a separate overclocked retest.
   main menu, with no gameplay performance data. Keep 2x MSAA enabled while investigating the visual regression.
 - [ ] One vs two frames in flight: compare throughput and frame tails against input latency (input lag was felt
   with shadows on; ChatGPT report #5).
-- [ ] 30 FPS cap (2 vblanks) once ~90 % of frames fit in 31 ms.
+- [ ] 30 FPS cap (2 vblanks) once ~90 % of Switch frames fit in 31 ms. The Mac accepts
+  `--bo1_min_frame_vblanks=2` and sustains 300 swaps/10 s, but this does not establish console headroom.
 - [ ] Count compute dispatches between draws and inventory passes/barriers/resolves. Then skip unused resolves,
   reduce unnecessary barriers, or move suitable work to a graphics pass; each draw/compute switch can idle NVK.
 - [ ] Depth-only pipelines without a fragment stage, if captures show meaningful depth-only work.
@@ -136,8 +138,10 @@ inconclusive; the user has requested a separate overclocked retest.
   alone did not produce a clear A/B gain. Vertex uploads are ~1-1.7 MB per frame.
 - [ ] If the hottest caller is still unclear, add per-stage renderer timers (PM4 decode, setup, textures, constants,
   uploads, Vulkan calls) and requested-versus-emitted state counters.
-- [ ] `bo1_native_record_thread` A/B (exists, off): move NVK's ~4-5 µs per draw recording to a worker. Try only
-  after profiling confirms renderer CPU pressure and enough scheduling headroom; verify correctness and frame tails.
+- [ ] `bo1_native_record_thread` A/B (exists, off): move NVK's ~4-5 µs per draw recording to a worker. The Mac Kino
+  check (2026-10-18, `out/mac/logs/bo1_087.log` vs `bo1_089.log`) stayed stable but raised renderer CPU from about
+  2.0 to 2.4 ms/frame, with no clear GPU or cap change. Leave it off; consider a Switch test only if a future profile
+  confirms renderer CPU pressure and enough scheduling headroom, then verify correctness and frame tails.
 - [ ] Reduce texture allocation/copy work: sub-allocate large blocks, upload only mip levels changed by a copy, and
   create images off the ring.
 - [ ] Confirm whether the render backend's `WaitForSingleObject` timeout-0 poll/yield loop costs console CPU; it was
@@ -157,11 +161,22 @@ inconclusive; the user has requested a separate overclocked retest.
 
 ### Faster guest code
 
-- [ ] Direct calls instead of weak aliases.
-- [ ] Float moves without FPCR mode switches (`fp_moves_modeless`).
-- [ ] Non-volatile registers as locals / no LR stores (needs shared registers for setjmp/SEH; Prototype 2 found its
-  exceptions with masseffect-nx's `read_before_write.py` and marks only those functions `share_registers`).
-- [ ] "Diet" lowerings.
+- [ ] Direct calls instead of weak aliases. The corrected Mac A/B (`args_in_registers`, excluding all 12 raw hooks)
+  lowered sampled host process CPU from ~46 % to ~41 % in one short Kino run, with renderer/GPU timings unchanged.
+  This is directional only; keep disabled until a Switch A/B confirms the gain and hook behavior.
+- [ ] Float moves without FPCR mode switches (`fp_moves_modeless`). The gated codegen option now covers bitwise
+  `fabs`/`fnabs`/`fneg`/`fmr` and removes 2,464 generated flush-mode calls. Its Mac Kino run showed no host gain
+  (~49.5 % sampled process CPU vs ~46.5 % baseline), so it remains off; only a Switch A/B can settle the A57 result.
+- [ ] Non-volatile registers as locals / no LR stores. Broad non-volatile locals still need shared-register analysis
+  for setjmp/SEH. `elide_lr_stores` preserved the two LR return sites read by the raw job-queue hook and reached Kino,
+  but showed no Mac CPU gain (~46%); the smoke run did not exercise all exception/setjmp paths. Any further evaluation
+  needs targeted correctness coverage and a Switch A/B.
+- [ ] "Diet" lowerings. `fctiwz_inline` changed 1,131 conversions in the Mac build but showed no clear host CPU or
+  renderer/GPU gain; keep off unless a Switch test demonstrates value. `dform_disp_split` is Switch-specific and is
+  intentionally not assessed by the Mac build.
+- [ ] `dcbt_prefetch` (existing, off): the Mac test emitted 239 read and 6 write prefetch hints but raised sampled
+  process CPU to ~50 % from ~46 % baseline, with slightly higher renderer/GPU readings. Leave off unless a Switch
+  profile shows memory-latency pressure; host evidence does not justify a console A/B by itself.
 - [ ] LTO + PGO and hot function ordering; follow the console PGO capture process in Recommended next steps.
 - [ ] Per-address locks for lwarx/stwcx. regions instead of one process-wide mutex (Prototype); check how our SDK
   serializes reservations.
