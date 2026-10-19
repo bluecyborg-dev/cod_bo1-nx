@@ -87,6 +87,46 @@ inconclusive; the user has requested a separate overclocked retest.
    binary. PGO could improve hot guest/native code broadly, but needs a capture session and release rebuild. Add LTO
    only when Docker has enough memory.
 
+### PC-decompilation validation queue (added 2026-10-18; runtime audit captured, follow-up unresolved)
+
+The PC Zombies decompilation at `refs/bo1-zombies-decompiled` is a reading reference only. It is a modded PC build;
+its `r_mod_*` variables and any differing flags/defaults do not establish Xbox 360 behavior. Do not implement these
+leads or copy its code until the matching 360 binary or runtime confirms them. The full source notes are in the
+[`nx-port-guide` Black Ops logbook](../nx-port-guide/platforms/xbox-360/black-ops/black-ops-logbook.md), under
+“What the PC decompilation explains.”
+
+1. [ ] **Close the 360 dvar write audit.** Static code confirms the flags are a 16-bit field at `dvar+0x0C`; the
+   setter checks bit `0x80` and may emit `%s is cheat protected.` based on a global at `0x832EF528`, whose identity as
+   `sv_cheats` is unproven. The archived diagnostic build
+   `out/elf-archive/bo1-nx-20261018-dvar-audit.nro` ran with `--bo1_shadows=min --bo1_profile_log=true` and no
+   `devmap`; it captured the user's Kino run. The runtime audit found the three cheat-flagged shadow dvars at current /
+   latched zero, with no cheat-protection message in the full log, but no pre-batch snapshot exists, so this does not
+   prove the requested `set` commands changed them. The user switched the live preset from `min` to `off` at
+   20:39:36.668; the log verified `sm_enable=0` and read back the direct `sm_sunShadowScale=1.0` write successfully.
+   Performance moved in a positive direction (16.9 to 18.57 FPS across 25 pre-switch and 11 post-switch windows), but
+   this was one sequential phase change with variable gameplay, not a controlled A/B. `r_enableDlights` is present as
+   an XEX string but absent from the runtime dvar pool; `r_fastSkin` is absent from the XEX. `r_lodScaleSkinned`,
+   `r_lodBiasSkinned`, and `sm_sunSampleSizeNear` were present at runtime. To close this item, capture before/after
+   values around a cheat-flagged dvar write and identify the guard global; keep the other PC candidates untested until
+   their runtime registration and flags are known.
+2. [ ] **Verify the worker callback's condition and producer on 360.** Generated code already confirms that
+   `sub_825BBFD0` and `sub_825BC040` return unfinished while `sub_825BBB88()` is nonzero, and the existing 100 µs
+   throttle has reduced worker CPU substantially. XenonRecomp shows the condition reads `0x83FB7220`; it also checks
+   per-job state before requeueing. A direct release store to this global has not been found, so the PC hypothesis
+   that it tracks the prior-frame dynamic-buffer upload remains unconfirmed on 360. Find the matching writer before
+   assessing an event/address wait in place of timed requeues; preserve a timeout/fallback and check for lost wakeups.
+3. [ ] **Locate and validate the skinned-vertex ranges.** The PC source describes two alternating 8 MiB pools and
+   CPU skinning at 32 bytes per vertex. The Switch renderer has measured about 1–1.7 MiB of uploads per frame, but
+   that does not identify those ranges. Find the 360 allocations and prove which renderer uploads map to them before
+   adding an exact-range copy path that skips hashing/comparison; guard it with counters and compare renderer CPU.
+4. [ ] **A/B runtime-confirmed game dvars one at a time.** The skinned LOD dvars and `sm_sunSampleSizeNear` are
+   present in the runtime pool; confirm value ranges and write behavior before A/B, with visual checks for LOD changes.
+   `r_enableDlights` has an XEX string but no runtime pool entry in this run, and `r_fastSkin` is absent from the XEX,
+   so keep both parked unless later evidence finds them registered. The PC source says `sm_sunShadowScale` is clamped
+   to 0.25–1.0 and scales resolution; it identifies `sm_sunSampleSizeNear` as the coverage lever, so do not plan to
+   lower the former below 0.25 or assume it shrinks coverage without 360 evidence. Keep `r_depthPrepass` low priority:
+   the native renderer's prepass-skip test already increased GPU time, and a game-side change matters only if CPU-bound.
+
 ### Completed or parked experiments
 
 - [x] **Stock-clock fourth-core access and workload-mask A/B.** The process can run on core 3, but matched `0x7`/`0xF`
@@ -102,7 +142,9 @@ inconclusive; the user has requested a separate overclocked retest.
 
 - [ ] **`min` closer to `off`**: with the shadow system on, the game still builds ~2,900 shadow-map caster draws per
   frame that `min` discards (Mac: 905k draws per 10 s vs 326k with `off`, 580k skipped). Shrink the sun shadow range
-  (`sm_sunShadowScale` < 0.25, `sm_sunSampleSizeNear` < 0.25) so they are not generated.
+  only after the 360 shadow dvars are verified. The PC reference says `sm_sunShadowScale` cannot go below 0.25 and
+  controls resolution; `sm_sunSampleSizeNear` may reduce coverage/caster work, but its 360 semantics and limits remain
+  unverified. See the validation queue above.
 - [x] **Live-menu A/B for `bo1_fx_lite`.** Settings overlay (`L+R+Right`) can change the preset during a run; the
   profiler labels each 10 s report block with the active phase, and the app log records when transition batches
   queue. This avoids rebuilding/relaunching between FX phases. Other settings need their own live-safety review;
@@ -161,9 +203,19 @@ inconclusive; the user has requested a separate overclocked retest.
 
 ### Faster guest code
 
-- [ ] Direct calls instead of weak aliases. The corrected Mac A/B (`args_in_registers`, excluding all 12 raw hooks)
-  lowered sampled host process CPU from ~46 % to ~41 % in one short Kino run, with renderer/GPU timings unchanged.
-  This is directional only; keep disabled until a Switch A/B confirms the gain and hook behavior.
+- [x] **Combined small-wins Switch test (2026-10-18).** Archived build:
+  `out/elf-archive/bo1-nx-20261018-smallwins-combined.nro`, with matching ELF and symbols. It enabled global
+  `args_in_registers` while excluding all 12 raw hooks, plus `fctiwz_inline`, `elide_lr_stores` (preserving the two
+  hooked LR return sites), `dcbt_prefetch`, `fp_moves_modeless`, and runtime `bo1_native_geometry_hash_every_16`.
+  Across 32 steady 10-second gameplay reports, the Switch averaged 19.29 FPS (median 19.5, range 17.4–20.1),
+  essentially tied with the preceding focused RE ABI run at 19.39 FPS and within the roughly 3 FPS run-to-run
+  variation. This test did not demonstrate a measurable gain; keep the combined options off by default. Full
+  measurements are in `docs/OPTIMIZATION_LOG.md`.
+- [x] Focused direct-call ABI allowlist for the RE worker path (`sub_825BBB88` / `sub_825DF470`; 30 functions).
+  The Switch capture averaged 19.39 FPS (median 19.6) versus 19.56 FPS in the prior stock-clock restore run; the
+  small negative difference is within the ~3 FPS run-to-run noise, so this test shows no measurable win. Keep the
+  focused candidate experimental and do not enable direct-call ABI conversion globally. See
+  `docs/OPTIMIZATION_LOG.md` and `docs/REVERSE_ENGINEERING_PILOT.md`.
 - [ ] Float moves without FPCR mode switches (`fp_moves_modeless`). The gated codegen option now covers bitwise
   `fabs`/`fnabs`/`fneg`/`fmr` and removes 2,464 generated flush-mode calls. Its Mac Kino run showed no host gain
   (~49.5 % sampled process CPU vs ~46.5 % baseline), so it remains off; only a Switch A/B can settle the A57 result.

@@ -114,6 +114,52 @@ The worker's unfinished-job loop is already throttled by `bo1_job_worker_sleep_u
 to apply. It does give us a way to inspect a specific function from a sampled PC/LR and compare the result with the
 generated C++ before proposing another change.
 
+## Follow-up: dvar guard and worker condition (2026-10-18)
+
+The same synthetic ELF carrier was reanalyzed with Ghidra 12.1.4 for the PC-decompilation leads. The complete
+`sub_823949E0` body (288 bytes) reads and writes the dvar flags as 16-bit values at offset `+0x0C`. The generated
+`sub_82393370` listing checks bit `0x80`, loads a pointer from `0x832EF528`, and reads the byte at pointer `+0x18`;
+when that byte is false on the relevant source path, it can emit the XEX string `%s is cheat protected.` at
+`0x82057634`. The image also contains the string `sv_cheats` at `0x8202F250`, but the current reference inventory does
+not connect that string to the global pointer, so its identity remains unconfirmed. This establishes the flag layout;
+the completed runtime audit below records the live dvar values and preset transition.
+
+The XEX has strings for `r_lodScaleSkinned`, `r_lodBiasSkinned`, `r_enableDlights`, and `sm_sunSampleSizeNear`, but no
+`r_fastSkin` string. Presence of a name does not establish that the variable is registered in the target game mode,
+what its flags/defaults are, or whether changing it improves performance.
+
+The REA query for `sub_825BBB88` exposed only an 8-byte thunk that calls `0x825F8434`; it did not recover the larger
+predicate body used by the generated project. XenonRecomp's generated implementation reads global address
+`0x83FB7220`, then checks additional per-job state before returning unfinished. A direct release store to
+`0x83FB7220` was not found in the generated-code search. That is not proof there is no writer: indirect stores or code
+outside the searched path remain possible. The PC claim that this state is the prior-frame dynamic-buffer upload
+condition, and the proposed event wait, therefore remain unverified on 360. Keep the measured timed-requeue throttle
+until the matching producer is identified.
+
+The diagnostic Switch build `out/elf-archive/bo1-nx-20261018-dvar-audit.nro` adds a one-pass report of candidate and
+shadow dvar flags/current/latched values after the initial command batch and verifies `sm_sunShadowScale` direct writes
+by reading both fields back. It does not change which dvars are written. The build passed with `_start` at address zero
+and was sent with `--bo1_shadows=min --bo1_profile_log=true`, without `devmap`; the complete capture is
+`out/net_logs/20261018-203322.log`. The user confirmed the game was already in Kino. The initial audit found
+`sm_qualitySpotShadow`, `r_spotLightEntityShadows`, and `r_spotLightSModelShadows` at flag `0x80` and current/latched
+zero; `sm_sunShadowScale` and `sm_sunSampleSizeNear` were both 0.25, `sm_maxLights=1`, and `sm_enable=1`. The skinned
+LOD dvars were present with flag `0x0001`, values 0 and 1. `r_enableDlights` was absent from the runtime dvar pool,
+although its name exists in the XEX; `r_fastSkin` has no XEX string. No cheat-protection message appears anywhere in
+the full capture. Because the audit ran only after the initial setting batch, it cannot prove that `set` changed the
+cheat-flagged variables; a pre-batch value or a controlled direct readback is still needed.
+
+At 20:39:36.668, the user switched the live shadow preset from `min` to `off`. The log records `set sm_enable 0`; the
+port's direct write of `sm_sunShadowScale=1.0` passed current/latched readback, and the follow-up audit reported
+`sm_enable=0`, `sm_sunShadowScale=1.0`, and `sm_sunSampleSizeNear=0.93`. Across 25 steady 10-second `min` reports,
+FPS averaged 16.9 (median 17.4, range 9.8–20.0), renderer CPU 41.1 ms/frame, and GPU 34.5 ms/frame. The 11 steady
+reports after switching to `off` averaged 18.57 FPS (median 19.0, range 15.2–19.9), renderer CPU 31.8 ms/frame, and
+GPU 30.8 ms/frame. That is a positive signal, but the run had one sequential transition while the active scene varied,
+so it does not establish an isolated shadow-off performance gain. The full 37-window gameplay capture averaged
+17.37 FPS (median 17.6, range 9.8–20.0). Job-queue reports averaged 323,817 unfinished requeues and 176,637 100 µs
+sleeps per 10 seconds. The high counts keep the 360 worker-condition investigation relevant but do not identify the
+producer or validate the PC dynamic-buffer explanation. The log has no fatal/crash marker and the stream closed after
+the game exited.
+
 ## Reliability limits
 
 Treat this pilot as static evidence with some unresolved limits:
@@ -137,6 +183,48 @@ static analysis and evidence capture. For actual Xenon recompilation, retain the
 [XenonRecomp code-generation pipeline](https://github.com/rexglue/rexglue-sdk/wiki/Codegen-Pipeline-Overview); REA does
 not replace that pipeline.
 
+## Switch profiler capture ready for REA
+
+The existing archived build is sufficient; no additional Switch NRO is needed to capture addresses for this workflow:
+`out/elf-archive/bo1-nx-20261018-hitch-stacks-oc-core-ab.nro`, with its matching unstripped ELF
+`out/elf-archive/bo1-20261018-hitch-stacks-oc-core-ab.elf` and symbol listing. It includes the long-frame marker and
+stack profiler. Run it with stack sampling and log forwarding enabled:
+
+```sh
+NRO=out/elf-archive/bo1-nx-20261018-hitch-stacks-oc-core-ab.nro \
+EXTRA_ARGS="--bo1_debug_exec=devmap+zombie_theater --bo1_debug_exec_delay_s=150 --bo1_profile_log=true --bo1_profile_stacks=true" \
+tools/nxlink_run.sh
+```
+
+The map loads automatically. Reports include per-thread samples and PC/LR pairs during frames of at least 100 ms. These
+are host addresses in the recompiled NRO: resolve them with the matching ELF first, then use the resulting generated
+`sub_...` function/address as the REA query seed. Stack sampling is a diagnostic mode that can perturb pacing; use it
+to locate code paths, not to compare frame rate. The auto-loaded map reaches the spawn point; an active-play capture can
+cover combat-specific paths and naturally occurring stalls. The launch, forwarding, and symbol
+resolution workflow is documented in `docs/BUILDING_NRO.md` and `docs/SWITCH_OPTIMIZATION_GUIDE.md`.
+
+### Results from the Switch capture
+
+The 2026-10-18 capture is `out/net_logs/20261018-182410.log`; it used the archived NRO and matching ELF listed above.
+The map loaded automatically and produced 68 post-load ten-second reports. Stack PCs were resolved against that ELF:
+the renderer samples repeatedly reached `memcmp`, `Renderer::Impl::RangeHash`, `FlatMap64::operator[]`, and
+`TextureCache::GetVolumeView`; audio samples reached `XmaContext::Work`, `decode_frame`, and
+`ff_wma_run_level_decode`. The REA worker targets also appeared in the capture: `image+0xe3f4f0` resolves to
+`sub_825BBB88`, sampled on Server, Backend, and JQ Worker threads, while the `image+0x872090` region resolves to
+`sub_825DF470` in Server/JQ Worker PC/LR pairs. Their individual sample shares were small, so treat them as leads to
+inspect in REA and generated code, not as proof of dominant CPU cost. The paired addresses provide further REA seeds:
+samples at `sub_825BBB88` carried LR-side symbols `sub_823BBCB8`, `sub_825DE5D0`, `sub_823AFDB8`,
+`sub_825C9B50`, and `sub_82546470`; samples with LR at `sub_825DF470` had PC-side symbols including
+`sub_8222C298`, `sub_825D1638`, and `sub_8236ED48`. These are sampled execution contexts; inspect the corresponding
+Ghidra call sites and compare them with XenonRecomp output before assigning exact call semantics.
+
+The profiler reported workload/process masks `0xF` and process CPU above 300% in 11 reports (355% peak), showing
+that process threads ran on core 3 at least some of the time. However, the effective clocks stayed at stock handheld
+values (CPU 1,020, GPU 460.8, memory 1,331.2 MHz), so this was not an overclock capture or a core-mask A/B. The
+native renderer recorded 45 post-load frames over 100 ms; the longest was 4.331 s, including 4.311 s of ring idle.
+That shows the renderer received no draw work during the pause, rather than waiting on a multi-second GPU operation.
+Because 1 ms stack sampling can perturb pacing, those frame-rate and hitch counts are diagnostic only.
+
 ## Next RE steps
 
 1. If continuing the worker investigation, analyze `sub_825BBB88` and `sub_825DF470` to clarify what condition keeps
@@ -146,4 +234,5 @@ not replace that pipeline.
 3. Only propose a native replacement after static control flow and call sites are understood; retain the current Switch
    A/B and rollback process.
 
-No Switch build was produced or sent as part of this pilot.
+The static analysis pilot itself did not produce a Switch build. A later focused direct-call ABI candidate and its
+Switch FPS run are recorded in `docs/OPTIMIZATION_LOG.md`.

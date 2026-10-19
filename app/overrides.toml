@@ -30,6 +30,12 @@ xer_as_local = true
 reserved_as_local = true
 cr_as_local = true
 
+# Restrict the direct-call ABI optimization to the two active worker routines, their direct callees and their
+# callbacks. The stable PPCContext ABI wrappers remain available for indirect job-queue dispatch. Function-level
+# A/B targets: sub_825BBB88 (shared readiness/initialization check) and sub_825DF470 (worker processing body).
+args_in_registers = true
+args_in_registers_include_file = "args_in_registers_targets.txt"
+
 [functions]
 # Filled in from codegen warnings and runtime "Call to invalid or unregistered function" errors.
 

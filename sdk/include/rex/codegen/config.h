@@ -115,9 +115,11 @@ struct RecompilerConfig {
 
   /// Arguments in registers (codegen/args_in_registers.h): direct calls between recompiled functions pass
   /// r3-r10, f1-f13, r0/r11/r12/f0 and lr as C++ arguments and return r3 as the C++ return value. The
-  /// functions named in `argsInRegistersExcludeFile` (hooked ones) keep the old ABI.
+  /// Functions named in `argsInRegistersExcludeFile` (hooked ones) keep the old ABI. When an include file is set,
+  /// only its listed functions are eligible for the direct-call ABI.
   bool argsInRegisters = false;
   std::string argsInRegistersExcludeFile;  ///< one emitted function name (sub_82XXXXXX) per line
+  std::string argsInRegistersIncludeFile;  ///< optional allowlist; one emitted function name per line
   bool argsInRegistersInstrument = false;  ///< ME_ARGS_COUNT entries (validation builds)
   bool argsInRegistersPoison = false;      ///< ME_ARGS_POISON before fast calls (validation builds)
 

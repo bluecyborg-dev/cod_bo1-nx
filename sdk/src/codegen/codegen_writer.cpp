@@ -341,6 +341,37 @@ bool CodegenWriter::write(bool force) {
           argsOpt.excluded.insert(line);
       }
     }
+    if (!config().argsInRegistersIncludeFile.empty()) {
+      std::ifstream in(config().argsInRegistersIncludeFile);
+      if (!in) {
+        REXCODEGEN_ERROR("args_in_registers_include_file: cannot read {}", config().argsInRegistersIncludeFile);
+        return false;
+      }
+      std::unordered_set<std::string> included;
+      std::string line;
+      while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+          line.pop_back();
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t'))
+          line.erase(line.begin());
+        if (!line.empty())
+          included.insert(line);
+      }
+      if (included.empty()) {
+        REXCODEGEN_ERROR("args_in_registers_include_file: {} contains no function names",
+                         config().argsInRegistersIncludeFile);
+        return false;
+      }
+      for (const auto& name : included) {
+        if (std::find(bodyNames.begin(), bodyNames.end(), name) == bodyNames.end()) {
+          REXCODEGEN_ERROR("args_in_registers_include_file: function {} was not emitted", name);
+          return false;
+        }
+      }
+      for (const auto& name : bodyNames)
+        if (!included.count(name))
+          argsOpt.excluded.insert(name);
+    }
     ArgsInRegistersStats argsStats;
     try {
       ApplyArgsInRegisters(bodyNames, bodies, argsDeclarations, argsOpt, &argsStats);

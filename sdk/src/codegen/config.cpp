@@ -139,6 +139,13 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
       p = std::filesystem::path(filePath).parent_path() / p;
     MergeScalar(cfg.argsInRegistersExcludeFile, p.string(), "args_in_registers_exclude_file");
   }
+  if (auto v = toml["args_in_registers_include_file"].value<std::string>()) {
+    // relative to the TOML that names it
+    std::filesystem::path p(*v);
+    if (p.is_relative())
+      p = std::filesystem::path(filePath).parent_path() / p;
+    MergeScalar(cfg.argsInRegistersIncludeFile, p.string(), "args_in_registers_include_file");
+  }
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }

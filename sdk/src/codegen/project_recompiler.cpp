@@ -65,6 +65,10 @@ std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& c
   for (const auto& loaded : cfg.loadedFiles) {
     inputs.emplace_back(loaded);
   }
+  if (!cfg.argsInRegistersExcludeFile.empty())
+    inputs.emplace_back(cfg.argsInRegistersExcludeFile);
+  if (!cfg.argsInRegistersIncludeFile.empty())
+    inputs.emplace_back(cfg.argsInRegistersIncludeFile);
   if (!cfg.templateDir.empty()) {
     std::error_code ec;
     for (const auto& entry : fs::recursive_directory_iterator(configDir / cfg.templateDir, ec)) {

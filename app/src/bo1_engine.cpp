@@ -10,6 +10,7 @@
 //              0x82313280.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -614,6 +615,82 @@ uint32_t FindDvarByName(uint8_t* base, uint32_t name_address) {
   return 0;
 }
 
+// 360 dvar audit targets: names are in default.xex. These are the existing shadow-preset settings and the PC
+// decompilation's candidate dvars, whose 360 presence/flags/value behavior must be checked before any A/B.
+struct DvarAuditTarget {
+  uint32_t name_address;
+  const char* name;
+};
+constexpr DvarAuditTarget kDvarAuditTargets[] = {
+    {0x820D4C14, "r_enableDlights"},
+    {0x820D6CB0, "sm_qualitySpotShadow"},
+    {0x820D6DCC, "sm_sunShadowSmallEnable"},
+    {0x820D6E0C, "sm_sunShadowScale"},
+    {0x820D6E84, "sm_sunSampleSizeNear"},
+    {0x820D70F4, "sm_maxLights"},
+    {0x820D71A8, "sm_enable"},
+    {0x820D7B8C, "r_spotLightEntityShadows"},
+    {0x820D7C00, "r_spotLightSModelShadows"},
+    {0x820D8FA4, "r_lodBiasSkinned"},
+    {0x820D8FB8, "r_lodScaleSkinned"},
+};
+
+uint16_t ReadDvarFlags(uint8_t* base, uint32_t dvar) {
+  uint16_t flags;
+  std::memcpy(&flags, base + dvar + 0x0C, sizeof(flags));
+  return __builtin_bswap16(flags);
+}
+
+uint32_t ReadDvarRawValue(uint8_t* base, uint32_t dvar, uint32_t type, uint32_t offset) {
+  if (type == 0) return base[dvar + offset];  // bool dvar
+  uint32_t value;
+  std::memcpy(&value, base + dvar + offset, sizeof(value));
+  return __builtin_bswap32(value);
+}
+
+void AuditEngineDvars(uint8_t* base, const char* phase) {
+  auto be32 = [&](uint32_t a) {
+    uint32_t value;
+    std::memcpy(&value, base + a, sizeof(value));
+    return __builtin_bswap32(value);
+  };
+  const uint32_t anchor = be32(kStreamDvarPointer);
+  if (!anchor || anchor >= 0xA0000000u || be32(anchor) != kStreamDvarName) {
+    REXLOG_WARN("bo1: dvar audit {} skipped: r_stream anchor invalid", phase);
+    return;
+  }
+
+  // Walk the nearby dvar pool once for all targets. A separate FindDvarByName call per target would scan the same
+  // 8 MiB range repeatedly on the game thread.
+  std::array<uint32_t, std::size(kDvarAuditTargets)> found{};
+  constexpr uint32_t kRange = 4u << 20;
+  const uint32_t begin = anchor > kRange ? anchor - kRange : 0;
+  for (uint32_t a = begin & ~3u; a < anchor + kRange; a += 4) {
+    const uint32_t name = be32(a);
+    const auto it = std::lower_bound(
+        std::begin(kDvarAuditTargets), std::end(kDvarAuditTargets), name,
+        [](const DvarAuditTarget& target, uint32_t address) { return target.name_address < address; });
+    if (it == std::end(kDvarAuditTargets) || it->name_address != name) continue;
+    const uint32_t type = be32(a + 0x10);
+    if (type <= 10) found[size_t(it - std::begin(kDvarAuditTargets))] = a;
+  }
+
+  for (size_t i = 0; i < std::size(kDvarAuditTargets); ++i) {
+    const DvarAuditTarget& target = kDvarAuditTargets[i];
+    const uint32_t dvar = found[i];
+    if (!dvar) {
+      REXLOG_INFO("bo1: dvar audit {} {} absent", phase, target.name);
+      continue;
+    }
+    const uint32_t type = be32(dvar + 0x10);
+    const uint16_t flags = ReadDvarFlags(base, dvar);
+    const uint32_t current = ReadDvarRawValue(base, dvar, type, 0x18);
+    const uint32_t latched = ReadDvarRawValue(base, dvar, type, 0x28);
+    REXLOG_INFO("bo1: dvar audit {} {} at {:08X} type={} flags={:04X} current={:08X} latched={:08X}", phase,
+                target.name, dvar, type, flags, current, latched);
+  }
+}
+
 // Writes a dvar's current and latched value directly, for the dvars whose "set" only takes effect at the next map
 // load (sm_sunShadowScale). Types seen: 0 bool (a byte), 1 float, 5 int.
 bool WriteDvarDirect(uint8_t* base, uint32_t dvar, const char* value) {
@@ -622,8 +699,13 @@ bool WriteDvarDirect(uint8_t* base, uint32_t dvar, const char* value) {
   type = __builtin_bswap32(type);
   uint32_t word;
   if (type == 0) {
-    base[dvar + 0x18] = base[dvar + 0x28] = uint8_t(std::atoi(value) != 0);
-    return true;
+    const uint8_t expected = uint8_t(std::atoi(value) != 0);
+    base[dvar + 0x18] = base[dvar + 0x28] = expected;
+    const bool verified = base[dvar + 0x18] == expected && base[dvar + 0x28] == expected;
+    REXLOG_INFO("bo1: direct dvar write type={} flags={:04X} expected={:02X} readback={:02X}/{:02X} {}", type,
+                ReadDvarFlags(base, dvar), expected, base[dvar + 0x18], base[dvar + 0x28],
+                verified ? "verified" : "FAILED");
+    return verified;
   } else if (type == 1) {
     const float f = float(std::atof(value));
     std::memcpy(&word, &f, 4);
@@ -635,7 +717,13 @@ bool WriteDvarDirect(uint8_t* base, uint32_t dvar, const char* value) {
   word = __builtin_bswap32(word);
   std::memcpy(base + dvar + 0x18, &word, 4);
   std::memcpy(base + dvar + 0x28, &word, 4);
-  return true;
+  const uint32_t expected = __builtin_bswap32(word);
+  const bool verified = ReadDvarRawValue(base, dvar, type, 0x18) == expected &&
+                        ReadDvarRawValue(base, dvar, type, 0x28) == expected;
+  REXLOG_INFO("bo1: direct dvar write type={} flags={:04X} expected={:08X} readback={:08X}/{:08X} {}", type,
+              ReadDvarFlags(base, dvar), expected, ReadDvarRawValue(base, dvar, type, 0x18),
+              ReadDvarRawValue(base, dvar, type, 0x28), verified ? "verified" : "FAILED");
+  return verified;
 }
 
 void MaybeToggleStreaming(PPCContext& ctx, uint8_t* base) {
@@ -671,7 +759,8 @@ void MaybeToggleStreaming(PPCContext& ctx, uint8_t* base) {
 
 // The console commands of a bo1_shadows preset. "min" keeps the shadow system on (with it off, models near lights
 // alternate between lit and dark every frame) and sets it to draw as little as it can: one light, no character or
-// static model casters, small low-quality maps, a quarter of the sun's range; the renderer then skips every shadow map
+// static model casters, small low-quality maps, and sets sm_sunShadowScale to 0.25; the renderer then skips every
+// shadow map
 // draw (bo1_native_skip_shadow_maps). The game's own values (sub_8258CDA8's dvar registration) are 4 lights, both
 // caster kinds, quality 1, sun scale 1, small sun map off; "off" leaves the system off, where the others do not
 // matter. sm_sunEnable, sm_spotEnable and r_spotLightShadows are not used: setting them changed nothing in a frame
@@ -800,11 +889,18 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
   }
   static std::atomic<uint64_t> first_ns{0}, last_ns{0}, shadows_checked_ns{0};
   static uint64_t fx_lite_checked_ns = 0;
+  static uint64_t dvar_audit_ns = 0;
+  static const char* dvar_audit_phase = nullptr;
   static bool applied_fx_lite = false;
   // Only this hook's thread reads these two.
   static std::string shadows = REXCVAR_GET(bo1_shadows);
   static std::string shadow_commands = ShadowCommands(shadows);
   const uint64_t now = NowNs();
+  if (dvar_audit_ns && now >= dvar_audit_ns) {
+    AuditEngineDvars(base, dvar_audit_phase ? dvar_audit_phase : "scheduled");
+    dvar_audit_ns = 0;
+    dvar_audit_phase = nullptr;
+  }
   uint64_t expected = 0;
   first_ns.compare_exchange_strong(expected, now);
   if (now - first_ns.load() < uint64_t(std::max(REXCVAR_GET(bo1_dvars_delay_s), 0)) * 1'000'000'000ull) return;
@@ -820,6 +916,8 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
       shadow_commands = ShadowCommands(current);
       if (!shadow_commands.empty()) QueueCommand(ctx, base, shadow_commands);
       WriteLatchedShadowDvars(base, current);
+      dvar_audit_ns = now + 1'000'000'000ull;
+      dvar_audit_phase = "after shadow preset";
       REXLOG_INFO("bo1: shadows set to {} live: {}", current, shadow_commands);
       return;
     }
@@ -831,6 +929,8 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
       const std::string& batch = fx_lite ? batches.live_fx_lite : batches.live_default;
       if (!batch.empty()) QueueCommand(ctx, base, batch);
       applied_fx_lite = fx_lite;
+      dvar_audit_ns = now + 1'000'000'000ull;
+      dvar_audit_phase = "after fx preset";
 #if defined(__SWITCH__)
       RexSwitchPerfSetABCondition(fx_lite ? "bo1_fx_lite=ON" : "bo1_fx_lite=OFF");
 #endif
@@ -853,7 +953,11 @@ void MaybeApplyDvars(PPCContext& ctx, uint8_t* base) {
   }
   if (batch.empty()) return;
   QueueCommand(ctx, base, batch);
-  if (!last) REXLOG_INFO("bo1: engine settings queued: {}", batch);
+  if (!last) {
+    dvar_audit_ns = now + 1'000'000'000ull;
+    dvar_audit_phase = "after initial batch";
+    REXLOG_INFO("bo1: engine settings queued: {}", batch);
+  }
 }
 
 void MaybeInjectDebugCommand(PPCContext& ctx, uint8_t* base) {
