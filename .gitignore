@@ -43,3 +43,6 @@
 __pycache__/
 *.pyc
 /cache/
+
+# Homebrew tools built from tools/*/source (rebuild with their Makefiles).
+/tools/**/*.nro

@@ -33,7 +33,9 @@ cr_as_local = true
 # Restrict the direct-call ABI optimization to the two active worker routines, their direct callees and their
 # callbacks. The stable PPCContext ABI wrappers remain available for indirect job-queue dispatch. Function-level
 # A/B targets: sub_825BBB88 (shared readiness/initialization check) and sub_825DF470 (worker processing body).
-args_in_registers = true
+# Off by default: the focused 30-function candidate showed no measured gain on the Switch (2026-10-18: 19.39 vs
+# 19.56 FPS mean, inside run-to-run noise). Set true (and regenerate with tools/codegen.sh) to A/B it again.
+args_in_registers = false
 args_in_registers_include_file = "args_in_registers_targets.txt"
 
 [functions]
